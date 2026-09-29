@@ -1,0 +1,2 @@
+1.cwru_data文件夹是轴承数据
+2.cwru_preprocess.py是制作数据集的代码
