@@ -1,0 +1,23 @@
+{
+  "records": 40,
+  "windows": 4431,
+  "by_split": {
+    "train": 3429,
+    "val": 481,
+    "test": 521
+  },
+  "by_class": {
+    "N": 1296,
+    "IR007": 351,
+    "OR007@6": 348,
+    "B007": 348,
+    "IR014": 348,
+    "OR014@6": 348,
+    "B014": 348,
+    "IR021": 348,
+    "OR021@6": 348,
+    "B021": 348
+  },
+  "rpm_missing": 2,
+  "rpm_imputation": "same-load median; see record_inventory.csv"
+}
