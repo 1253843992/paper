@@ -21,6 +21,27 @@ pip install -r requirements_echo_cil.txt
 python train_echocil.py --data echo_cil_processed --epochs 10 --batch-size 64
 ```
 
+设备选择：
+
+```bash
+# 自动选择：优先 CUDA，其次 MPS，最后 CPU
+python train_echocil.py --device auto
+
+# 强制使用第一张 NVIDIA GPU，并开启混合精度（默认）
+python train_echocil.py --device cuda:0 --amp
+
+# 强制使用 CPU
+python train_echocil.py --device cpu --no-amp
+```
+
+启动时会打印实际使用的设备。若指定 `--device cuda` 但当前 PyTorch
+不是 CUDA 版本、NVIDIA 驱动不可用或没有可见 GPU，程序会立即给出明确错误，
+不会悄悄退回 CPU。可用下面的命令检查环境：
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
 输出目录默认为 `runs/echo_cil`，包含 `stage_0.pt`、`stage_1.pt`、`stage_2.pt` 和 `results.json`。
 
 ## 重要实验约束

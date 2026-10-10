@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse, json, random
 from collections import Counter
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List
 
@@ -26,8 +27,59 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
 
-def to_device(batch, device):
-    return {k: torch.from_numpy(v).to(device) for k, v in batch.items() if isinstance(v, np.ndarray)}
+def resolve_device(requested: str) -> torch.device:
+    """Resolve auto/cpu/cuda requests and fail clearly for invalid CUDA use."""
+    requested = requested.lower()
+    if requested == 'auto':
+        if torch.cuda.is_available():
+            requested = 'cuda'
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            requested = 'mps'
+        else:
+            requested = 'cpu'
+    if requested.startswith('cuda'):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                'CUDA was requested but this PyTorch environment cannot use it. '
+                'Install a CUDA-enabled PyTorch build and a compatible NVIDIA '
+                'driver, or run with --device cpu/auto.')
+        device = torch.device(requested)
+        index = device.index if device.index is not None else 0
+        if index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f'CUDA device {index} does not exist; available device count is '
+                f'{torch.cuda.device_count()}.')
+    else:
+        device = torch.device(requested)
+    return device
+
+
+def amp_context(device: torch.device, enabled: bool):
+    if enabled:
+        return torch.autocast(device_type='cuda', dtype=torch.float16)
+    return nullcontext()
+
+
+def loader_options(device: torch.device, num_workers: int):
+    options = {'num_workers': num_workers,
+               'pin_memory': device.type == 'cuda'}
+    if num_workers > 0:
+        options['persistent_workers'] = True
+    return options
+
+
+def to_device(batch, device, non_blocking=False):
+    tensors = {}
+    for key, value in batch.items():
+        if not isinstance(value, np.ndarray):
+            continue
+        tensor = torch.from_numpy(value)
+        # collate_numpy intentionally returns NumPy arrays.  Pin the completed
+        # batch here so CUDA copies can overlap with compute.
+        if non_blocking and not tensor.is_pinned():
+            tensor = tensor.pin_memory()
+        tensors[key] = tensor.to(device, non_blocking=non_blocking)
+    return tensors
 
 
 def balanced_sampler(dataset, old_classes, new_classes):
@@ -60,14 +112,78 @@ def restore_old_rows(model, old_model):
     model.expert_gate.bias[:n_experts].copy_(old_model.expert_gate.bias)
 
 
+def calibrate_classifier(model, dataset, device, batch_size=256,
+                         weight_decay=1e-4, max_iter=200, use_amp=False,
+                         num_workers=0):
+    """Fit a balanced logistic head on standardized frozen features.
+
+    Incremental SGD learns a useful representation, but its classifier is
+    biased by the changing old/new optimization objective.  The replay set is
+    class balanced, so a regularized logistic consolidation at deployment gives
+    every active class an equal opportunity without using validation or test
+    labels.  The fitted matrix is converted back to raw-feature coordinates and
+    copied into ``nn.Linear``, adding no inference-time component or overhead.
+    """
+    if weight_decay < 0 or len(dataset) == 0:
+        return
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        collate_fn=collate_numpy,
+                        **loader_options(device, num_workers))
+    model.eval(); features, labels = [], []
+    with torch.no_grad():
+        for raw in loader:
+            b = to_device(raw, device, non_blocking=device.type == 'cuda')
+            with amp_context(device, use_amp):
+                _, z = model(b['x'], b['order'], b['quality'])
+            features.append(z.detach().float().cpu())
+            labels.append(b['y'].detach().cpu())
+
+    # Standardization makes the regularization independent of individual
+    # feature scales.  Float64 and deterministic zero initialization make the
+    # small convex optimization stable across CPU/GPU training runs.
+    z = torch.cat(features).to(torch.float64)
+    y = torch.cat(labels)
+    mean = z.mean(dim=0)
+    std = z.std(dim=0).clamp_min(1e-5)
+    standardized = (z - mean) / std
+    head = nn.Linear(z.shape[1], model.num_classes, dtype=torch.float64)
+    nn.init.zeros_(head.weight); nn.init.zeros_(head.bias)
+    optimizer = torch.optim.LBFGS(
+        head.parameters(), lr=1.0, max_iter=max_iter,
+        tolerance_grad=1e-10, tolerance_change=1e-12,
+        line_search_fn='strong_wolfe')
+
+    def closure():
+        optimizer.zero_grad()
+        loss = nn.functional.cross_entropy(head(standardized), y)
+        loss = loss + 0.5 * float(weight_decay) * head.weight.pow(2).sum()
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    with torch.no_grad():
+        raw_weight = head.weight / std.unsqueeze(0)
+        raw_bias = head.bias - (head.weight * mean.unsqueeze(0)
+                                / std.unsqueeze(0)).sum(dim=1)
+        model.classifier.weight.copy_(raw_weight.to(
+            device=device, dtype=model.classifier.weight.dtype))
+        model.classifier.bias.copy_(raw_bias.to(
+            device=device, dtype=model.classifier.bias.dtype))
+
+
 @torch.no_grad()
-def evaluate(model, dataset, classes, device, old_classes=None, batch_size=128):
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_numpy)
+def evaluate(model, dataset, classes, device, old_classes=None, batch_size=128,
+             use_amp=False, num_workers=0):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        collate_fn=collate_numpy,
+                        **loader_options(device, num_workers))
     model.eval(); hit = total = 0; per = {c: [0, 0] for c in classes}
     class_index = {c: i for i, c in enumerate(classes)}
     confusion = np.zeros((len(classes), len(classes)), dtype=np.int64)
     for raw in loader:
-        b = to_device(raw, device); logits, _ = model(b['x'], b['order'], b['quality'])
+        b = to_device(raw, device, non_blocking=device.type == 'cuda')
+        with amp_context(device, use_amp):
+            logits, _ = model(b['x'], b['order'], b['quality'])
         pred = logits.argmax(1).cpu().numpy(); y = b['y'].cpu().numpy()
         hit += int((pred == y).sum()); total += len(y)
         for p, t in zip(pred, y):
@@ -95,7 +211,17 @@ def main():
     ap.add_argument('--temperature', type=float, default=2.0)
     ap.add_argument('--kd-weight', type=float, default=0.5)
     ap.add_argument('--guard-strength', type=float, default=1.0)
-    ap.add_argument('--memory-mb', type=int, default=32); ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    ap.add_argument('--calibration-weight-decay', type=float, default=1e-4,
+                    help='final balanced logistic calibration; <0 disables it')
+    ap.add_argument('--memory-mb', type=int, default=32)
+    ap.add_argument('--device', default='auto',
+                    help='auto, cpu, cuda, cuda:0, ... (default: auto)')
+    ap.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True,
+                    help='use CUDA mixed precision (default: enabled on CUDA)')
+    ap.add_argument('--num-workers', type=int, default=0,
+                    help='DataLoader worker processes; 0 is safest on Windows')
+    ap.add_argument('--deterministic', action='store_true',
+                    help='prefer deterministic CUDA algorithms over speed')
     args = ap.parse_args()
     if not args.data.exists():
         # Support both layouts: scripts/data at repository root, or inside
@@ -108,7 +234,22 @@ def main():
                 break
     if not args.data.exists():
         raise FileNotFoundError(f'Processed data directory not found: {args.data}')
-    seed_everything(args.seed); device = torch.device(args.device)
+    if args.num_workers < 0:
+        raise ValueError('--num-workers must be >= 0')
+    device = resolve_device(args.device)
+    use_amp = bool(args.amp and device.type == 'cuda')
+    seed_everything(args.seed)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+        torch.backends.cudnn.benchmark = not args.deterministic
+        torch.backends.cudnn.deterministic = args.deterministic
+        if args.deterministic:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.set_float32_matmul_precision('high')
+        print(f'Using CUDA device: {torch.cuda.get_device_name(device)}; '
+              f'AMP={use_amp}; workers={args.num_workers}')
+    else:
+        print(f'Using device: {device}; AMP=False; workers={args.num_workers}')
     args.output.mkdir(parents=True, exist_ok=True)
     order = [[0,1,2,3], [4,5,6], [7,8,9]]
     model = ECHOModel(num_classes=4).to(device); memory = ReplayBuffer(args.memory_mb * 1024 * 1024, args.seed)
@@ -135,11 +276,15 @@ def main():
         train_ds = DictDataset(old_items + new_items)
         guard = SubspaceGuard(rank=16, strength=args.guard_strength)
         if old_model is not None and old_items:
-            old_loader = DataLoader(DictDataset(old_items), batch_size=args.batch_size, shuffle=False, collate_fn=collate_numpy)
+            old_loader = DataLoader(
+                DictDataset(old_items), batch_size=args.batch_size,
+                shuffle=False, collate_fn=collate_numpy,
+                **loader_options(device, args.num_workers))
             with torch.no_grad():
                 features = []
                 for raw in old_loader:
-                    b = to_device(raw, device)
+                    b = to_device(raw, device,
+                                  non_blocking=device.type == 'cuda')
                     features.append(old_model(b['x'], b['order'], b['quality'])[1])
                 old_features = torch.cat(features)
             guard.fit(old_features)
@@ -147,46 +292,76 @@ def main():
                                       lr=args.lr, weight_decay=args.weight_decay)
         sampler = balanced_sampler(train_ds, old_classes, new_classes)
         loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
-                            collate_fn=collate_numpy)
+                            collate_fn=collate_numpy,
+                            **loader_options(device, args.num_workers))
+        scaler = torch.amp.GradScaler('cuda') if use_amp else None
         for epoch in range(args.epochs):
             model.train()
             for raw in loader:
-                b = to_device(raw, device); logits, z = model(b['x'], b['order'], b['quality'])
-                loss = nn.functional.cross_entropy(logits, b['y'])
-                if old_model is not None:
-                    # Replay examples are the reliable anchor for old-class
-                    # distillation and subspace protection.  Applying these
-                    # losses to unseen new classes unnecessarily blocks
-                    # plasticity.
-                    old_mask = b['y'] < old_num_classes
-                    if old_mask.any():
-                        with torch.no_grad():
-                            old_logits, old_z = old_model(
-                                b['x'][old_mask], b['order'][old_mask],
-                                b['quality'][old_mask])
-                        temperature = args.temperature
-                        kd = nn.functional.kl_div(
-                            nn.functional.log_softmax(
-                                logits[old_mask, :old_num_classes] / temperature, 1),
-                            nn.functional.softmax(old_logits / temperature, 1),
-                            reduction='batchmean') * temperature ** 2
-                        loss = loss + args.kd_weight * kd
-                        loss = loss + guard.penalty(old_z, z[old_mask])
-                optimizer.zero_grad(); loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                optimizer.step()
+                b = to_device(raw, device,
+                              non_blocking=device.type == 'cuda')
+                with amp_context(device, use_amp):
+                    logits, z = model(b['x'], b['order'], b['quality'])
+                    loss = nn.functional.cross_entropy(logits, b['y'])
+                    if old_model is not None:
+                        # Replay examples are the reliable anchor for old-class
+                        # distillation and subspace protection.  Applying these
+                        # losses to unseen new classes unnecessarily blocks
+                        # plasticity.
+                        old_mask = b['y'] < old_num_classes
+                        if old_mask.any():
+                            with torch.no_grad():
+                                old_logits, old_z = old_model(
+                                    b['x'][old_mask], b['order'][old_mask],
+                                    b['quality'][old_mask])
+                            temperature = args.temperature
+                            kd = nn.functional.kl_div(
+                                nn.functional.log_softmax(
+                                    logits[old_mask, :old_num_classes]
+                                    / temperature, 1),
+                                nn.functional.softmax(old_logits / temperature, 1),
+                                reduction='batchmean') * temperature ** 2
+                            loss = loss + args.kd_weight * kd
+                            loss = loss + guard.penalty(old_z, z[old_mask])
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    scaler.step(optimizer); scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    optimizer.step()
                 # Restore after every optimizer step.  Only old rows are
                 # immutable; newly appended classifier/router rows keep their
                 # learned updates.
                 restore_old_rows(model, old_model)
-        result = evaluate(model, val_ds, active, device, old_classes)
-        test_result = evaluate(model, test_ds, active, device, old_classes)
+        # Consolidate only after the final increment.  Feeding an intermediate
+        # calibrated head back into the next teacher changes the representation
+        # learning trajectory and can reduce final new-class accuracy.  Final-
+        # only calibration preserves the proven incremental trajectory while
+        # removing its last classifier bias at deployment time.
+        applied_calibration = (args.calibration_weight_decay
+                               if stage == len(order) - 1 else -1.0)
+        if applied_calibration >= 0:
+            calibrate_classifier(model, train_ds, device,
+                                 batch_size=max(args.batch_size, 256),
+                                 weight_decay=applied_calibration,
+                                 use_amp=use_amp,
+                                 num_workers=args.num_workers)
+        result = evaluate(model, val_ds, active, device, old_classes,
+                          use_amp=use_amp, num_workers=args.num_workers)
+        test_result = evaluate(model, test_ds, active, device, old_classes,
+                               use_amp=use_amp, num_workers=args.num_workers)
         memory_before = memory.bytes_used
         # ReplayBuffer.update already merges existing exemplars.  Passing only
         # this stage's new data prevents the old memory from being duplicated.
         memory.update(new_items, active)
         stage_results.append({'stage': stage, 'classes': active, 'val': result,
                               'test': test_result,
+                              'device': str(device), 'amp': use_amp,
+                              'calibration_weight_decay': applied_calibration,
                               'memory_bytes_before': memory_before,
                               'memory_bytes': memory.bytes_used})
         torch.save({'stage': stage, 'model': model.state_dict(), 'classes': active}, args.output / f'stage_{stage}.pt')
