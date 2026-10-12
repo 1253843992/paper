@@ -112,50 +112,49 @@ def restore_old_rows(model, old_model):
     model.expert_gate.bias[:n_experts].copy_(old_model.expert_gate.bias)
 
 
-def calibrate_classifier(model, dataset, device, batch_size=256,
-                         weight_decay=1e-4, max_iter=200, use_amp=False,
-                         num_workers=0):
-    """Fit a balanced logistic head on standardized frozen features.
-
-    Incremental SGD learns a useful representation, but its classifier is
-    biased by the changing old/new optimization objective.  The replay set is
-    class balanced, so a regularized logistic consolidation at deployment gives
-    every active class an equal opportunity without using validation or test
-    labels.  The fitted matrix is converted back to raw-feature coordinates and
-    copied into ``nn.Linear``, adding no inference-time component or overhead.
-    """
-    if weight_decay < 0 or len(dataset) == 0:
-        return
+@torch.no_grad()
+def extract_features(model, dataset, device, batch_size=256, num_workers=0):
+    """Extract frozen features in FP32 for reproducible head selection."""
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         collate_fn=collate_numpy,
                         **loader_options(device, num_workers))
     model.eval(); features, labels = [], []
-    with torch.no_grad():
-        for raw in loader:
-            b = to_device(raw, device, non_blocking=device.type == 'cuda')
-            with amp_context(device, use_amp):
-                _, z = model(b['x'], b['order'], b['quality'])
-            features.append(z.detach().float().cpu())
-            labels.append(b['y'].detach().cpu())
+    for raw in loader:
+        b = to_device(raw, device, non_blocking=device.type == 'cuda')
+        # Deliberately do not use autocast: the final errors are boundary cases
+        # where FP16 rounding can change the predicted class.
+        _, z = model(b['x'], b['order'], b['quality'])
+        features.append(z.detach().float().cpu())
+        labels.append(b['y'].detach().cpu())
+    return torch.cat(features).to(torch.float64), torch.cat(labels)
 
-    # Standardization makes the regularization independent of individual
-    # feature scales.  Float64 and deterministic zero initialization make the
-    # small convex optimization stable across CPU/GPU training runs.
-    z = torch.cat(features).to(torch.float64)
-    y = torch.cat(labels)
+
+def fit_logistic_head(z, y, num_classes, weight_decay, class_balanced,
+                      max_iter=200):
+    """Fit one deterministic convex candidate and return raw-space weights."""
     mean = z.mean(dim=0)
     std = z.std(dim=0).clamp_min(1e-5)
     standardized = (z - mean) / std
-    head = nn.Linear(z.shape[1], model.num_classes, dtype=torch.float64)
+    head = nn.Linear(z.shape[1], num_classes, dtype=torch.float64)
     nn.init.zeros_(head.weight); nn.init.zeros_(head.bias)
     optimizer = torch.optim.LBFGS(
         head.parameters(), lr=1.0, max_iter=max_iter,
         tolerance_grad=1e-10, tolerance_change=1e-12,
         line_search_fn='strong_wolfe')
 
+    sample_weights = None
+    if class_balanced:
+        counts = torch.bincount(y, minlength=num_classes).to(torch.float64)
+        class_weights = counts.sum() / counts.clamp_min(1.0)
+        class_weights = class_weights / class_weights.mean()
+        sample_weights = class_weights[y]
+
     def closure():
         optimizer.zero_grad()
-        loss = nn.functional.cross_entropy(head(standardized), y)
+        losses = nn.functional.cross_entropy(
+            head(standardized), y, reduction='none')
+        loss = ((losses * sample_weights).mean()
+                if sample_weights is not None else losses.mean())
         loss = loss + 0.5 * float(weight_decay) * head.weight.pow(2).sum()
         loss.backward()
         return loss
@@ -165,10 +164,74 @@ def calibrate_classifier(model, dataset, device, batch_size=256,
         raw_weight = head.weight / std.unsqueeze(0)
         raw_bias = head.bias - (head.weight * mean.unsqueeze(0)
                                 / std.unsqueeze(0)).sum(dim=1)
-        model.classifier.weight.copy_(raw_weight.to(
+    return raw_weight, raw_bias
+
+
+@torch.no_grad()
+def score_head(weight, bias, z, y, classes, old_classes):
+    pred = (z @ weight.t() + bias).argmax(dim=1)
+    per_class = {}
+    for c in classes:
+        mask = y == c
+        per_class[c] = float((pred[mask] == y[mask]).double().mean())
+    new_classes = [c for c in classes if c not in old_classes]
+    group_mean = lambda cs: float(np.mean([per_class[c] for c in cs])) if cs else 0.0
+    old_acc = group_mean(old_classes)
+    new_acc = group_mean(new_classes)
+    macro = group_mean(classes)
+    overall = float((pred == y).double().mean())
+    metrics = {'overall': overall, 'macro': macro, 'old': old_acc,
+               'new': new_acc, 'worst_class': min(per_class.values())}
+    # Protect both sides of class-incremental learning first, then macro and
+    # worst-class performance. Test labels are never consulted here.
+    score = (min(old_acc, new_acc), macro, metrics['worst_class'], overall)
+    return score, metrics
+
+
+def calibrate_classifier(model, train_dataset, validation_dataset, classes,
+                         old_classes, device, batch_size=256,
+                         weight_decays=(1e-4,), max_iter=200, num_workers=0):
+    """Select the final linear head using validation data only.
+
+    Candidates include the SGD head plus balanced and ordinary logistic heads
+    across several regularization strengths. Only the selected linear matrix
+    is retained, so inference cost remains unchanged.
+    """
+    if not weight_decays or len(train_dataset) == 0:
+        return {'method': 'disabled'}
+    train_z, train_y = extract_features(
+        model, train_dataset, device, batch_size, num_workers)
+    val_z, val_y = extract_features(
+        model, validation_dataset, device, batch_size, num_workers)
+
+    original_weight = model.classifier.weight.detach().cpu().to(torch.float64)
+    original_bias = model.classifier.bias.detach().cpu().to(torch.float64)
+    best_score, best_metrics = score_head(
+        original_weight, original_bias, val_z, val_y, classes, old_classes)
+    best = {'method': 'sgd', 'weight_decay': None,
+            'class_balanced': False, **best_metrics}
+    best_weight, best_bias = original_weight, original_bias
+
+    for class_balanced in (True, False):
+        for weight_decay in weight_decays:
+            weight, bias = fit_logistic_head(
+                train_z, train_y, model.num_classes, weight_decay,
+                class_balanced, max_iter=max_iter)
+            candidate_score, metrics = score_head(
+                weight, bias, val_z, val_y, classes, old_classes)
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best_weight, best_bias = weight, bias
+                best = {'method': 'logistic',
+                        'weight_decay': float(weight_decay),
+                        'class_balanced': class_balanced, **metrics}
+
+    with torch.no_grad():
+        model.classifier.weight.copy_(best_weight.to(
             device=device, dtype=model.classifier.weight.dtype))
-        model.classifier.bias.copy_(raw_bias.to(
+        model.classifier.bias.copy_(best_bias.to(
             device=device, dtype=model.classifier.bias.dtype))
+    return best
 
 
 @torch.no_grad()
@@ -212,7 +275,11 @@ def main():
     ap.add_argument('--kd-weight', type=float, default=0.5)
     ap.add_argument('--guard-strength', type=float, default=1.0)
     ap.add_argument('--calibration-weight-decay', type=float, default=1e-4,
-                    help='final balanced logistic calibration; <0 disables it')
+                    help='preferred final calibration strength; <0 disables it')
+    ap.add_argument('--calibration-grid', type=float, nargs='+',
+                    default=[1e-5, 1e-4, 1e-3],
+                    help='regularization candidates selected on validation')
+    ap.add_argument('--calibration-max-iter', type=int, default=200)
     ap.add_argument('--memory-mb', type=int, default=32)
     ap.add_argument('--device', default='auto',
                     help='auto, cpu, cuda, cuda:0, ... (default: auto)')
@@ -344,16 +411,21 @@ def main():
         # removing its last classifier bias at deployment time.
         applied_calibration = (args.calibration_weight_decay
                                if stage == len(order) - 1 else -1.0)
+        calibration = {'method': 'not_final_stage'}
         if applied_calibration >= 0:
-            calibrate_classifier(model, train_ds, device,
-                                 batch_size=max(args.batch_size, 256),
-                                 weight_decay=applied_calibration,
-                                 use_amp=use_amp,
-                                 num_workers=args.num_workers)
+            weight_decays = list(dict.fromkeys(
+                [applied_calibration] + args.calibration_grid))
+            calibration = calibrate_classifier(
+                model, train_ds, val_ds, active, old_classes, device,
+                batch_size=max(args.batch_size, 256),
+                weight_decays=weight_decays,
+                max_iter=args.calibration_max_iter,
+                num_workers=args.num_workers)
+            print(f'Final head selected on validation: {calibration}')
         result = evaluate(model, val_ds, active, device, old_classes,
-                          use_amp=use_amp, num_workers=args.num_workers)
+                          use_amp=False, num_workers=args.num_workers)
         test_result = evaluate(model, test_ds, active, device, old_classes,
-                               use_amp=use_amp, num_workers=args.num_workers)
+                               use_amp=False, num_workers=args.num_workers)
         memory_before = memory.bytes_used
         # ReplayBuffer.update already merges existing exemplars.  Passing only
         # this stage's new data prevents the old memory from being duplicated.
@@ -362,6 +434,7 @@ def main():
                               'test': test_result,
                               'device': str(device), 'amp': use_amp,
                               'calibration_weight_decay': applied_calibration,
+                              'calibration': calibration,
                               'memory_bytes_before': memory_before,
                               'memory_bytes': memory.bytes_used})
         torch.save({'stage': stage, 'model': model.state_dict(), 'classes': active}, args.output / f'stage_{stage}.pt')
