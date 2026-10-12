@@ -247,6 +247,9 @@ class ECHOModel(nn.Module):
         self.fusion = CrossDomainFusion(feature_dim)
         self.experts = nn.ModuleList()
         self.classifier = IncrementalClassifier(feature_dim, base_classes)
+        self.register_buffer('prototype_vectors', torch.empty(0, feature_dim))
+        self.register_buffer('prototype_labels', torch.empty(0, dtype=torch.long))
+        self.register_buffer('prototype_weight', torch.tensor(0.0))
         self.feature_dim = feature_dim
         self.expert_rank = expert_rank
         self.expert_limit = expert_limit
@@ -297,7 +300,40 @@ class ECHOModel(nn.Module):
                 enabled_current: Optional[Iterable[int]] = None):
         z, diagnostics = self.representation(
             x, order, quality, rpm, enabled_current=enabled_current)
-        return self.classifier(z), z, diagnostics
+        logits = self.classifier(z)
+        if (not self.training and self.prototype_vectors.numel()
+                and float(self.prototype_weight) > 0.0):
+            similarities = (F.normalize(z.float(), dim=1)
+                            @ F.normalize(self.prototype_vectors.float(), dim=1).t())
+            scale = self.classifier.logit_scale.exp().clamp(max=100.0)
+            prototype_logits = logits.new_full(logits.shape, -1e4)
+            positions = {label: index for index, label in enumerate(self.class_ids)}
+            for label in self.prototype_labels.unique().tolist():
+                if int(label) in positions:
+                    mask = self.prototype_labels == int(label)
+                    prototype_logits[:, positions[int(label)]] = (
+                        scale * similarities[:, mask].max(dim=1).values)
+            weight = self.prototype_weight.to(logits)
+            logits = (1.0 - weight) * logits + weight * prototype_logits
+        return logits, z, diagnostics
+
+    def set_prototypes(self, vectors: Tensor, labels: Tensor,
+                       weight: float = 0.5) -> None:
+        self.prototype_vectors = vectors.detach().float().to(
+            next(self.parameters()).device)
+        self.prototype_labels = labels.detach().long().to(
+            next(self.parameters()).device)
+        self.prototype_weight.fill_(float(weight))
+
+    def set_prototype_weight(self, weight: float) -> None:
+        self.prototype_weight.fill_(float(weight))
+
+    def clear_prototypes(self) -> None:
+        device = next(self.parameters()).device
+        self.prototype_vectors = torch.empty(
+            0, self.feature_dim, device=device)
+        self.prototype_labels = torch.empty(0, dtype=torch.long, device=device)
+        self.prototype_weight.zero_()
 
     def freeze_base(self) -> None:
         for module in (self.evidence, self.quality_gate, self.time, self.fusion):
@@ -316,6 +352,7 @@ class ECHOModel(nn.Module):
 
     def begin_increment(self, new_classes: Sequence[int], stage: int) -> nn.Linear:
         self.current_stage = int(stage)
+        self.clear_prototypes()
         self.freeze_base()
         for expert in self.experts:
             expert.requires_grad_(False)
@@ -345,4 +382,6 @@ class ECHOModel(nn.Module):
             'expert_limit': self.expert_limit,
             'feature_dim': self.feature_dim,
             'expert_rank': self.expert_rank,
+            'prototype_count': int(self.prototype_vectors.shape[0]),
+            'prototype_weight': float(self.prototype_weight),
         }

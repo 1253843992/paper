@@ -59,9 +59,10 @@ def amp_context(device: torch.device, enabled: bool):
             if enabled and device.type == 'cuda' else nullcontext())
 
 
-def loader_options(device: torch.device, workers: int) -> dict:
+def loader_options(device: torch.device, workers: int,
+                   persistent: bool = False) -> dict:
     options = {'num_workers': workers, 'pin_memory': device.type == 'cuda'}
-    if workers:
+    if workers and persistent:
         options['persistent_workers'] = True
     return options
 
@@ -80,7 +81,7 @@ def make_loader(dataset: DictDataset, old_classes: Sequence[int],
     sampler = GroupBalancedBatchSampler(
         dataset, old_classes, new_classes, batch_size, seed)
     loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_numpy,
-                        **loader_options(device, workers))
+                        **loader_options(device, workers, persistent=True))
     return loader, sampler
 
 
@@ -299,6 +300,59 @@ def extract_representations(model: ECHOModel, dataset, device: torch.device,
             batch['x'], batch['order'], batch['quality'], batch['rpm'])
         features.append(z.float().cpu()); labels.append(batch['y'].cpu())
     return torch.cat(features), torch.cat(labels)
+
+
+@torch.no_grad()
+def build_record_prototypes(model: ECHOModel, dataset, device: torch.device,
+                            batch_size: int, workers: int,
+                            per_record: int = 4) -> tuple[Tensor, Tensor]:
+    """Build multiple temporal prototypes per class and source record/load."""
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        collate_fn=collate_numpy,
+                        **loader_options(device, workers))
+    model.eval(); features, labels, records = [], [], []
+    for raw in loader:
+        batch = to_device(raw, device)
+        z, _ = model.representation(
+            batch['x'], batch['order'], batch['quality'], batch['rpm'])
+        features.append(z.float().cpu())
+        labels.append(batch['y'].cpu())
+        records.append(torch.from_numpy(raw['record_id']).long())
+    features = torch.cat(features)
+    labels = torch.cat(labels)
+    records = torch.cat(records)
+    vectors, vector_labels = [], []
+    for label in sorted(set(labels.tolist())):
+        label_mask = labels == label
+        for record in sorted(set(records[label_mask].tolist())):
+            mask = label_mask & (records == record)
+            record_features = features[mask]
+            for chunk in torch.tensor_split(
+                    record_features, min(per_record, len(record_features))):
+                if len(chunk):
+                    mean = chunk.mean(dim=0)
+                    vectors.append(nn.functional.normalize(mean, dim=0))
+                    vector_labels.append(label)
+    return torch.stack(vectors), torch.as_tensor(vector_labels, dtype=torch.long)
+
+
+def tune_prototype_weight(model: ECHOModel, val_dataset,
+                          active_classes: Sequence[int], task_groups,
+                          device: torch.device, batch_size: int,
+                          workers: int, candidates: Sequence[float]) -> tuple[float, List[dict]]:
+    trials, best_weight, best_score = [], 0.0, -float('inf')
+    for weight in candidates:
+        model.set_prototype_weight(float(weight))
+        metrics = evaluate(model, val_dataset, active_classes, task_groups,
+                           device, batch_size, workers)
+        score = 0.5 * (metrics['macro'] + metrics['old_new_harmonic'])
+        trials.append({'weight': float(weight), 'score': score,
+                       'macro': metrics['macro'],
+                       'old_new_harmonic': metrics['old_new_harmonic']})
+        if score > best_score:
+            best_score, best_weight = score, float(weight)
+    model.set_prototype_weight(best_weight)
+    return best_weight, trials
 
 
 @torch.no_grad()
@@ -543,9 +597,13 @@ def main() -> None:
                         default=config_values.get('expert_group_warmup_epochs', 3))
     parser.add_argument('--incremental-epochs', type=int,
                         default=config_values.get('incremental_epochs', 60))
+    parser.add_argument('--consolidation-epochs', type=int,
+                        default=config_values.get('consolidation_epochs', 40))
     parser.add_argument('--lr', type=float, default=config_values.get('lr', 5e-4))
     parser.add_argument('--backbone-lr', type=float,
                         default=config_values.get('backbone_lr', 1e-5))
+    parser.add_argument('--consolidation-lr', type=float,
+                        default=config_values.get('consolidation_lr', 1e-4))
     parser.add_argument('--weight-decay', type=float,
                         default=config_values.get('weight_decay', 1e-4))
     parser.add_argument('--competition-margin', type=float,
@@ -564,6 +622,11 @@ def main() -> None:
                         default=config_values.get('supcon_temperature', 0.07))
     parser.add_argument('--early-stopping-patience', type=int,
                         default=config_values.get('early_stopping_patience', 10))
+    parser.add_argument('--prototype-weights', type=float, nargs='+',
+                        default=config_values.get(
+                            'prototype_weights', [0.0, 0.25, 0.5, 0.75, 1.0]))
+    parser.add_argument('--prototypes-per-record', type=int,
+                        default=config_values.get('prototypes_per_record', 4))
     parser.add_argument('--memory-bytes', type=int,
                         default=config_values.get('memory_budget_bytes', 32 * 1024 * 1024))
     parser.add_argument('--experts-per-stage', type=int,
@@ -593,10 +656,12 @@ def main() -> None:
         raise ValueError('--batch-size must be even')
     if args.num_workers < 0:
         raise ValueError('--num-workers must be non-negative')
-    if args.backbone_lr <= 0 or args.lr <= 0:
+    if args.backbone_lr <= 0 or args.lr <= 0 or args.consolidation_lr <= 0:
         raise ValueError('learning rates must be positive')
     if args.kd_temperature <= 0 or args.supcon_temperature <= 0:
         raise ValueError('loss temperatures must be positive')
+    if args.prototypes_per_record <= 0:
+        raise ValueError('--prototypes-per-record must be positive')
 
     device = resolve_device(args.device)
     use_amp = bool(args.amp and device.type == 'cuda')
@@ -644,7 +709,8 @@ def main() -> None:
         train_loader, train_sampler = make_loader(
             train_dataset, old_classes, new_classes, args.batch_size,
             args.seed + stage * 1000, device, args.num_workers)
-        stage_log = {'head_warmup': [], 'expert_warmup': [], 'joint': []}
+        stage_log = {'head_warmup': [], 'expert_warmup': [], 'joint': [],
+                     'consolidation': []}
         protection_json = {'rank': 0, 'selected_edges': [], 'candidate_edges': []}
         conflicts_json, expert_groups, projection_max_error = {}, [], 0.0
         previous_model = None
@@ -658,7 +724,7 @@ def main() -> None:
                 base_stage=True, lambda_supcon=args.lambda_supcon,
                 supcon_temperature=args.supcon_temperature,
                 validation=(val_dataset, active_classes, order[:stage + 1],
-                            args.batch_size, args.num_workers),
+                            args.batch_size, 0),
                 early_stopping_patience=args.early_stopping_patience)
             stage_log['joint'] = history
             total_steps = steps
@@ -757,7 +823,7 @@ def main() -> None:
                 lambda_supcon=args.lambda_supcon,
                 supcon_temperature=args.supcon_temperature,
                 validation=(val_dataset, active_classes, order[:stage + 1],
-                            args.batch_size, args.num_workers),
+                            args.batch_size, 0),
                 early_stopping_patience=args.early_stopping_patience)
             stage_log['joint'] = history
             total_steps = head_steps + warmup_steps + joint_steps
@@ -783,6 +849,35 @@ def main() -> None:
                     projection_max_error = projection_error(
                         protection.basis, old_weight, old_classes,
                         protection.selected, raw)
+
+        # Accuracy-oriented consolidation: the replay budget contains the full
+        # observed training set, so jointly refine all layers with uniform
+        # class sampling. Validation-only early stopping prevents test leakage.
+        if stage > 0 and args.consolidation_epochs > 0:
+            model.requires_grad_(True)
+            consolidation_loader, consolidation_sampler = make_loader(
+                train_dataset, [], active_classes, args.batch_size,
+                args.seed + stage * 1000 + 707, device, args.num_workers)
+            consolidation_steps, consolidation_history = train_epochs(
+                model, consolidation_loader, consolidation_sampler,
+                model.parameters(), args.consolidation_epochs, device, use_amp,
+                args.consolidation_lr, args.weight_decay, [], active_classes,
+                args.competition_margin, 0.0, 0.0, base_stage=True,
+                lambda_supcon=args.lambda_supcon,
+                supcon_temperature=args.supcon_temperature,
+                validation=(val_dataset, active_classes, order[:stage + 1],
+                            args.batch_size, 0),
+                early_stopping_patience=args.early_stopping_patience)
+            total_steps += consolidation_steps
+            stage_log['consolidation'] = consolidation_history
+
+        prototype_vectors, prototype_labels = build_record_prototypes(
+            model, train_dataset, device, args.batch_size, 0,
+            per_record=args.prototypes_per_record)
+        model.set_prototypes(prototype_vectors, prototype_labels, weight=0.0)
+        prototype_weight, prototype_trials = tune_prototype_weight(
+            model, val_dataset, active_classes, order[:stage + 1], device,
+            args.batch_size, 0, args.prototype_weights)
 
         val_result = evaluate(
             model, val_dataset, active_classes, order[:stage + 1], device,
@@ -813,6 +908,9 @@ def main() -> None:
                            'projection_max_error': projection_max_error},
             'conflict_scores': conflicts_json,
             'expert_groups': expert_groups,
+            'prototype_count': int(prototype_vectors.shape[0]),
+            'prototype_weight': prototype_weight,
+            'prototype_trials': prototype_trials,
             'experts_total': len(model.experts),
             'memory_count': len(memory.all()),
             'memory_counts': memory.counts(),
@@ -828,6 +926,17 @@ def main() -> None:
             'device': str(device), 'amp': use_amp,
         }
         stage_results.append(result)
+        # Keep a valid recoverable result after every stage. A later failure
+        # must not discard already completed stage metrics.
+        partial_output = {
+            'protocol': 'ECHO-CIL-optimized', 'order_name': args.order,
+            'order': order, 'seed': args.seed, 'configuration': configuration,
+            'stages': stage_results, 'summary': experiment_summary(stage_results),
+            'complete': stage == len(order) - 1,
+        }
+        (args.output / 'results.json').write_text(
+            json.dumps(partial_output, ensure_ascii=False, indent=2, default=str),
+            encoding='utf-8')
         print(json.dumps({
             'stage': stage, 'test_macro': test_result['macro'],
             'old': test_result['old'], 'new': test_result['new'],
@@ -839,6 +948,7 @@ def main() -> None:
         'protocol': 'ECHO-CIL-optimized', 'order_name': args.order,
         'order': order, 'seed': args.seed, 'configuration': configuration,
         'stages': stage_results, 'summary': experiment_summary(stage_results),
+        'complete': True,
     }
     (args.output / 'results.json').write_text(
         json.dumps(output, ensure_ascii=False, indent=2, default=str),
