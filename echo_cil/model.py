@@ -1,130 +1,329 @@
 from __future__ import annotations
 
 import copy
-from typing import Iterable, List
+import math
+from typing import Dict, Iterable, List, Optional, Sequence
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from .physics import (
+    FS_TARGET, HARMONIC_NUMBERS, HARMONIC_ORDERS, HARMONIC_TYPES,
+    ORDER_MAX, ORDER_POINTS, WINDOW,
+)
 
-class DilatedResidualBlock(nn.Module):
-    def __init__(self, channels: int, dilation: int):
+
+class ConvGNAct(nn.Sequential):
+    def __init__(self, in_channels: int, out_channels: int, kernel: int,
+                 stride: int = 1, padding: int = 0):
+        super().__init__(
+            nn.Conv1d(in_channels, out_channels, kernel, stride=stride,
+                      padding=padding, bias=False),
+            nn.GroupNorm(8, out_channels), nn.SiLU(),
+        )
+
+
+class QualityGate(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(channels, channels, 7, padding=3 * dilation, dilation=dilation),
-            nn.BatchNorm1d(channels), nn.GELU(), nn.Dropout(0.1),
-            nn.Conv1d(channels, channels, 5, padding=2 * dilation, dilation=dilation),
-            nn.BatchNorm1d(channels))
-        self.act = nn.GELU()
+        self.net = nn.Sequential(nn.Linear(9, 16), nn.SiLU(), nn.Linear(16, 1))
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.act(x + self.net(x))
+    def forward(self, quality: Tensor) -> Tensor:
+        return torch.sigmoid(self.net(quality))
 
 
-class SignalEncoder(nn.Module):
-    def __init__(self, out_dim: int = 128):
+class HarmonicEvidence(nn.Module):
+    """Three-band order encoder plus 21 distance-biased harmonic queries."""
+
+    def __init__(self, dim: int = 128, heads: int = 4):
         super().__init__()
-        self.stem = nn.Sequential(nn.Conv1d(1, 32, 15, stride=2, padding=7), nn.BatchNorm1d(32), nn.GELU())
-        self.blocks = nn.Sequential(*[DilatedResidualBlock(32, d) for d in (1, 3, 7)])
-        self.down = nn.Sequential(nn.Conv1d(32, 64, 5, stride=2, padding=2), nn.BatchNorm1d(64), nn.GELU(),
-                                  nn.Conv1d(64, 96, 5, stride=2, padding=2), nn.BatchNorm1d(96), nn.GELU())
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(96, out_dim)
+        if dim % heads:
+            raise ValueError('feature dimension must be divisible by heads')
+        self.dim, self.heads, self.head_dim = dim, heads, dim // heads
+        self.encoder = nn.Sequential(
+            ConvGNAct(3, 32, 7, padding=3),
+            ConvGNAct(32, 64, 5, stride=2, padding=2),
+            ConvGNAct(64, 128, 5, stride=2, padding=2),
+        )
+        self.type_embedding = nn.Embedding(7, dim)
+        self.harmonic_embedding = nn.Embedding(3, dim)
+        self.position_projection = nn.Linear(dim, dim)
+        self.query_projection = nn.Linear(dim, dim)
+        self.key_projection = nn.Linear(dim, dim)
+        self.value_projection = nn.Linear(dim, dim)
+        self.output_projection = nn.Linear(dim, dim)
+        self.offset_raw = nn.Parameter(torch.zeros(21))
+        self.width_raw = nn.Parameter(torch.full(
+            (21,), math.log(math.expm1(0.2))))
+        self.register_buffer('anchor_orders', torch.from_numpy(HARMONIC_ORDERS))
+        self.register_buffer('anchor_types', torch.from_numpy(HARMONIC_TYPES))
+        self.register_buffer('harmonic_numbers', torch.from_numpy(HARMONIC_NUMBERS))
+        token_orders = torch.arange(64, dtype=torch.float32) * 4.0 * ORDER_MAX / (ORDER_POINTS - 1)
+        self.register_buffer('token_orders', token_orders)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.down(self.blocks(self.stem(x.unsqueeze(1))))
-        return self.fc(self.pool(x).flatten(1))
+    def _position_encoding(self) -> Tensor:
+        frequencies = torch.exp(torch.linspace(
+            0.0, math.log(1000.0), self.dim // 2,
+            device=self.anchor_orders.device))
+        phase = self.anchor_orders.unsqueeze(1) / frequencies.unsqueeze(0)
+        return torch.cat((torch.sin(phase), torch.cos(phase)), dim=1)
+
+    def forward(self, order: Tensor, rpm: Tensor):
+        tokens = self.encoder(order).transpose(1, 2)  # [B, 64, 128]
+        queries = (self.type_embedding(self.anchor_types)
+                   + self.harmonic_embedding(self.harmonic_numbers)
+                   + self.position_projection(self._position_encoding()))
+        queries = self.query_projection(queries).view(21, self.heads, self.head_dim)
+        keys = self.key_projection(tokens).view(
+            tokens.shape[0], 64, self.heads, self.head_dim)
+        values = self.value_projection(tokens).view(
+            tokens.shape[0], 64, self.heads, self.head_dim)
+        logits = torch.einsum('qhd,bkhd->bhqk', queries, keys)
+        logits = logits / math.sqrt(self.head_dim)
+
+        shaft_hz = rpm.float().clamp_min(1.0) / 60.0
+        spectral_floor = FS_TARGET / (WINDOW * shaft_hz)
+        receptive_floor = order.new_tensor(9.0 * ORDER_MAX / (ORDER_POINTS - 1))
+        sigma_min = torch.maximum(spectral_floor, receptive_floor)
+        sigma = sigma_min[:, None] + F.softplus(self.width_raw)[None, :]
+        centers = self.anchor_orders + 0.25 * torch.tanh(self.offset_raw)
+        distance = self.token_orders[None, None, :] - centers[None, :, None]
+        bias = -(distance ** 2) / (2.0 * sigma[:, :, None] ** 2)
+        attention = torch.softmax(logits + bias[:, None, :, :], dim=-1)
+        evidence = torch.einsum('bhqk,bkhd->bqhd', attention, values)
+        evidence = self.output_projection(evidence.reshape(order.shape[0], 21, self.dim))
+        return evidence, attention
 
 
-class PhysicsEncoder(nn.Module):
-    def __init__(self, out_dim: int = 128):
+class ConditionalScaleBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.spec = nn.Sequential(nn.Conv1d(3, 32, 9, padding=4), nn.BatchNorm1d(32), nn.GELU(),
-                                  nn.Conv1d(32, 64, 7, padding=3), nn.GELU(), nn.AdaptiveAvgPool1d(1))
-        self.quality = nn.Sequential(nn.Linear(9, 32), nn.LayerNorm(32), nn.GELU(), nn.Dropout(0.1))
-        self.fc = nn.Sequential(nn.Linear(96, out_dim), nn.LayerNorm(out_dim), nn.GELU())
+        self.downsample = ConvGNAct(in_channels, out_channels, 3,
+                                    stride=2, padding=1)
+        self.branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(out_channels, out_channels, 5, padding=2 * dilation,
+                          dilation=dilation, groups=out_channels, bias=False),
+                nn.GroupNorm(8, out_channels), nn.SiLU(),
+            ) for dilation in (1, 3, 7)
+        ])
+        self.controller = nn.Sequential(
+            nn.Linear(128, 32), nn.SiLU(), nn.Linear(32, 3))
+        self.pointwise = nn.Conv1d(out_channels, out_channels, 1, bias=False)
+        self.output_norm = nn.GroupNorm(8, out_channels)
 
-    def forward(self, order: Tensor, quality: Tensor) -> Tensor:
-        a = self.spec(order).flatten(1)
-        return self.fc(torch.cat([a, self.quality(quality)], dim=1))
+    def forward(self, x: Tensor, evidence_mean: Tensor, gamma: Tensor):
+        trunk = self.downsample(x)
+        conditional = torch.softmax(self.controller(evidence_mean), dim=-1)
+        alpha = (1.0 - gamma) / 3.0 + gamma * conditional
+        branches = torch.stack([branch(trunk) for branch in self.branches], dim=1)
+        mixed = (branches * alpha[:, :, None, None]).sum(dim=1)
+        output = F.silu(self.output_norm(trunk + self.pointwise(mixed)))
+        return output, alpha
 
 
-class LowRankExpert(nn.Module):
-    def __init__(self, dim: int = 128, rank: int = 8):
+class TimeEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.stem = ConvGNAct(1, 32, 15, stride=4, padding=7)
+        self.blocks = nn.ModuleList([
+            ConditionalScaleBlock(32, 64),
+            ConditionalScaleBlock(64, 96),
+            ConditionalScaleBlock(96, 128),
+        ])
+
+    def forward(self, x: Tensor, evidence: Tensor, gamma: Tensor):
+        x = self.stem(x.unsqueeze(1))
+        evidence_mean = evidence.mean(dim=1)
+        weights = []
+        for block in self.blocks:
+            x, alpha = block(x, evidence_mean, gamma)
+            weights.append(alpha)
+        return x.transpose(1, 2), weights  # [B, 64, 128]
+
+
+class CrossDomainFusion(nn.Module):
+    def __init__(self, dim: int = 128):
+        super().__init__()
+        self.time_norm = nn.LayerNorm(dim)
+        self.evidence_norm = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(dim, 4, batch_first=True)
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, 256), nn.SiLU(), nn.Linear(256, dim))
+        self.output = nn.Linear(dim, dim)
+
+    def forward(self, time_tokens: Tensor, evidence: Tensor, gamma: Tensor):
+        interaction, cross_attention = self.attention(
+            self.time_norm(time_tokens), self.evidence_norm(evidence),
+            self.evidence_norm(evidence), need_weights=True,
+            average_attn_weights=False)
+        fused = time_tokens + gamma[:, None, :] * interaction
+        fused = fused + self.ffn(self.ffn_norm(fused))
+        return self.output(fused.mean(dim=1)), cross_attention
+
+
+class ProtectedExpert(nn.Module):
+    def __init__(self, basis: Tensor, stage: int, group: Sequence[int],
+                 dim: int = 128, rank: int = 8):
         super().__init__()
         self.down = nn.Linear(dim, rank, bias=False)
         self.up = nn.Linear(rank, dim, bias=False)
-        self.norm = nn.LayerNorm(dim)
-        # A newly appended expert must be a strict no-op.  This preserves the
-        # previous-stage function until the new expert starts learning.
+        self.gate = nn.Sequential(
+            nn.Linear(dim + 1, 16), nn.SiLU(), nn.Linear(16, 1))
         nn.init.zeros_(self.up.weight)
+        self.register_buffer('basis', basis.detach().float().clone())
+        self.stage = int(stage)
+        self.group = tuple(int(value) for value in group)
+
+    def forward(self, h: Tensor, gamma: Tensor):
+        # The technical plan requires the projection itself to remain FP32
+        # even when the surrounding training step uses CUDA autocast.
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            h32, gamma32 = h.float(), gamma.float()
+            raw = self.up(F.silu(self.down(h32)))
+            if self.basis.numel():
+                projected = raw - (raw @ self.basis) @ self.basis.transpose(0, 1)
+            else:
+                projected = raw
+            gate = torch.sigmoid(self.gate(torch.cat((h32, gamma32), dim=1)))
+        return gate * projected, gate, raw
+
+
+class IncrementalClassifier(nn.Module):
+    def __init__(self, feature_dim: int, base_classes: Sequence[int]):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.heads = nn.ModuleList([nn.Linear(feature_dim, len(base_classes))])
+        self.class_chunks: List[List[int]] = [list(map(int, base_classes))]
+
+    @property
+    def class_ids(self) -> List[int]:
+        return [label for chunk in self.class_chunks for label in chunk]
 
     def forward(self, z: Tensor) -> Tensor:
-        return self.up(F.gelu(self.down(self.norm(z))))
+        return torch.cat([head(z) for head in self.heads], dim=1)
+
+    def add_classes(self, classes: Sequence[int]) -> nn.Linear:
+        for head in self.heads:
+            head.requires_grad_(False)
+        head = nn.Linear(self.feature_dim, len(classes)).to(self.heads[0].weight.device)
+        self.heads.append(head)
+        self.class_chunks.append(list(map(int, classes)))
+        return head
+
+    def freeze_all(self) -> None:
+        self.requires_grad_(False)
+
+    def weight_bias(self) -> tuple[Tensor, Tensor]:
+        return (torch.cat([head.weight for head in self.heads], dim=0),
+                torch.cat([head.bias for head in self.heads], dim=0))
+
+    def target_indices(self, labels: Tensor) -> Tensor:
+        mapping = {label: index for index, label in enumerate(self.class_ids)}
+        values = [mapping[int(label)] for label in labels.detach().cpu().tolist()]
+        return torch.as_tensor(values, device=labels.device, dtype=torch.long)
 
 
 class ECHOModel(nn.Module):
-    """ECHO-CIL encoder, gated low-rank experts and expandable classifier."""
-    def __init__(self, num_classes: int = 4, feature_dim: int = 128, rank: int = 8):
+    """Strict ECHO-CIL network: conditional encoder plus protected experts."""
+
+    def __init__(self, base_classes: Sequence[int], feature_dim: int = 128,
+                 expert_rank: int = 8, expert_limit: int = 4):
         super().__init__()
-        self.signal = SignalEncoder(feature_dim)
-        self.physics = PhysicsEncoder(feature_dim)
-        self.fusion = nn.Sequential(nn.Linear(feature_dim * 2, feature_dim), nn.LayerNorm(feature_dim), nn.GELU())
-        self.gate = nn.Linear(feature_dim, 1)
-        self.experts = nn.ModuleList([LowRankExpert(feature_dim, rank)])
-        self.expert_gate = nn.Linear(feature_dim, 1)
-        self.classifier = nn.Linear(feature_dim, num_classes)
+        self.evidence = HarmonicEvidence(feature_dim, heads=4)
+        self.quality_gate = QualityGate()
+        self.time = TimeEncoder()
+        self.fusion = CrossDomainFusion(feature_dim)
+        self.experts = nn.ModuleList()
+        self.classifier = IncrementalClassifier(feature_dim, base_classes)
         self.feature_dim = feature_dim
-        self.rank = rank
+        self.expert_rank = expert_rank
+        self.expert_limit = expert_limit
+        self.current_stage = 0
+
+    @property
+    def class_ids(self) -> List[int]:
+        return self.classifier.class_ids
 
     @property
     def num_classes(self) -> int:
-        return self.classifier.out_features
+        return len(self.class_ids)
 
-    def encode(self, x: Tensor, order: Tensor, quality: Tensor) -> Tensor:
-        zs, zp = self.signal(x), self.physics(order, quality)
-        # A learned scalar gate chooses how much physical information enters.
-        alpha = torch.sigmoid(self.gate(zs))
-        return self.fusion(torch.cat([zs, alpha * zp], dim=1))
+    def base_features(self, x: Tensor, order: Tensor, quality: Tensor, rpm: Tensor):
+        gamma = self.quality_gate(quality)
+        evidence, harmonic_attention = self.evidence(order, rpm)
+        time_tokens, scale_weights = self.time(x, evidence, gamma)
+        h, cross_attention = self.fusion(time_tokens, evidence, gamma)
+        diagnostics = {
+            'gamma': gamma, 'harmonic_attention': harmonic_attention,
+            'scale_weights': scale_weights, 'cross_attention': cross_attention,
+        }
+        return h, gamma, diagnostics
 
-    def forward(self, x: Tensor, order: Tensor, quality: Tensor):
-        z = self.encode(x, order, quality)
-        deltas = torch.stack([e(z) for e in self.experts], dim=1)
-        # Experts produce residual deltas only.  Do not divide by the number
-        # of experts: adding a zero-initialized expert must not rescale old
-        # expert contributions or change old predictions.
-        scores = torch.sigmoid(self.expert_gate(z))
-        z = z + (deltas * scores.unsqueeze(-1)).sum(1)
-        return self.classifier(z), z
+    def representation(self, x: Tensor, order: Tensor, quality: Tensor,
+                       rpm: Tensor, enabled_current: Optional[Iterable[int]] = None):
+        h, gamma, diagnostics = self.base_features(x, order, quality, rpm)
+        z = h
+        current_delta = torch.zeros_like(h)
+        gates, raw_residuals = [], []
+        enabled = None if enabled_current is None else set(enabled_current)
+        for index, expert in enumerate(self.experts):
+            is_current = expert.stage == self.current_stage
+            if is_current and enabled is not None and index not in enabled:
+                continue
+            delta, gate, raw = expert(h, gamma)
+            z = z + delta
+            if is_current:
+                current_delta = current_delta + delta
+            gates.append(gate); raw_residuals.append(raw)
+        diagnostics['expert_gates'] = gates
+        diagnostics['raw_residuals'] = raw_residuals
+        diagnostics['current_delta'] = current_delta
+        diagnostics['h'] = h
+        return z, diagnostics
 
-    def add_expert(self) -> None:
-        for p in self.experts.parameters():
-            p.requires_grad_(False)
-        self.experts.append(LowRankExpert(self.feature_dim, self.rank).to(next(self.parameters()).device))
-        old = self.expert_gate
-        new = nn.Linear(self.feature_dim, old.out_features + 1).to(old.weight.device)
-        with torch.no_grad():
-            new.weight[:old.out_features].copy_(old.weight)
-            new.bias[:old.out_features].copy_(old.bias)
-            nn.init.zeros_(new.weight[old.out_features:]); nn.init.zeros_(new.bias[old.out_features:])
-        self.expert_gate = new
+    def forward(self, x: Tensor, order: Tensor, quality: Tensor, rpm: Tensor,
+                enabled_current: Optional[Iterable[int]] = None):
+        z, diagnostics = self.representation(
+            x, order, quality, rpm, enabled_current=enabled_current)
+        return self.classifier(z), z, diagnostics
 
-    def expand_classes(self, new_num_classes: int) -> None:
-        if new_num_classes <= self.num_classes:
-            return
-        old = self.classifier
-        new = nn.Linear(self.feature_dim, new_num_classes).to(old.weight.device)
-        with torch.no_grad():
-            new.weight[:old.out_features].copy_(old.weight)
-            new.bias[:old.out_features].copy_(old.bias)
-            nn.init.normal_(new.weight[old.out_features:], 0, 0.02)
-            nn.init.zeros_(new.bias[old.out_features:])
-        self.classifier = new
+    def freeze_base(self) -> None:
+        for module in (self.evidence, self.quality_gate, self.time, self.fusion):
+            module.requires_grad_(False)
+            module.eval()
 
-    def frozen_copy(self) -> "ECHOModel":
+    def begin_increment(self, new_classes: Sequence[int], stage: int) -> nn.Linear:
+        self.current_stage = int(stage)
+        self.freeze_base()
+        for expert in self.experts:
+            expert.requires_grad_(False)
+            expert.eval()
+        return self.classifier.add_classes(new_classes)
+
+    def add_expert(self, basis: Tensor, group: Sequence[int]) -> int:
+        if len(self.experts) >= self.expert_limit:
+            raise RuntimeError('expert budget exhausted')
+        expert = ProtectedExpert(
+            basis, self.current_stage, group, self.feature_dim, self.expert_rank)
+        expert = expert.to(next(self.parameters()).device)
+        self.experts.append(expert)
+        return len(self.experts) - 1
+
+    def frozen_copy(self) -> 'ECHOModel':
         model = copy.deepcopy(self)
         model.eval()
-        for p in model.parameters():
-            p.requires_grad_(False)
+        model.requires_grad_(False)
         return model
+
+    def architecture_metadata(self) -> Dict[str, object]:
+        return {
+            'class_chunks': self.classifier.class_chunks,
+            'expert_stages': [expert.stage for expert in self.experts],
+            'expert_groups': [list(expert.group) for expert in self.experts],
+            'expert_limit': self.expert_limit,
+            'feature_dim': self.feature_dim,
+            'expert_rank': self.expert_rank,
+        }

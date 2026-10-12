@@ -1,308 +1,484 @@
-"""Train and evaluate ECHO-CIL on the processed CWRU shards.
-
-Run from this directory:
-    python train_echocil.py --data echo_cil_processed --epochs 5 --batch-size 64
-"""
+"""Train the strict ECHO-CIL protocol described in the technical plan."""
 from __future__ import annotations
 
-import argparse, json, random
-from collections import Counter
+import argparse
+import hashlib
+import json
+import math
+import random
+import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch import Tensor, nn
+from torch.utils.data import DataLoader
 
-from echo_cil.data import DictDataset, EchoCILDataset, collate_numpy
-from echo_cil.guard import SubspaceGuard
+from echo_cil.data import (
+    DictDataset, EchoCILDataset, GroupBalancedBatchSampler, collate_numpy,
+)
+from echo_cil.guard import build_protection, projection_error
 from echo_cil.memory import ReplayBuffer
 from echo_cil.model import ECHOModel
+from echo_cil.physics import load_physics_stats, physics_features
+
+
+ORDERS = {
+    'O0': [[0, 1, 2, 3], [4, 5, 6], [7, 8, 9]],
+    'O1': [[0, 7, 8, 9], [4, 5, 6], [1, 2, 3]],
+    'O2': [[0, 4, 9, 2], [6, 1, 8], [3, 7, 5]],
+    'O3': [[0, 8, 3, 4], [2, 7, 6], [9, 5, 1]],
+    'O4': [[0, 6, 7, 5], [1, 9, 2], [8, 4, 3]],
+}
 
 
 def seed_everything(seed: int) -> None:
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def resolve_device(requested: str) -> torch.device:
-    """Resolve auto/cpu/cuda requests and fail clearly for invalid CUDA use."""
     requested = requested.lower()
     if requested == 'auto':
-        if torch.cuda.is_available():
-            requested = 'cuda'
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            requested = 'mps'
-        else:
-            requested = 'cpu'
-    if requested.startswith('cuda'):
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                'CUDA was requested but this PyTorch environment cannot use it. '
-                'Install a CUDA-enabled PyTorch build and a compatible NVIDIA '
-                'driver, or run with --device cpu/auto.')
-        device = torch.device(requested)
-        index = device.index if device.index is not None else 0
-        if index >= torch.cuda.device_count():
-            raise RuntimeError(
-                f'CUDA device {index} does not exist; available device count is '
-                f'{torch.cuda.device_count()}.')
-    else:
-        device = torch.device(requested)
+        requested = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if requested.startswith('cuda') and not torch.cuda.is_available():
+        raise RuntimeError(
+            f'CUDA device {requested!r} requested, but CUDA is unavailable. '
+            'Install a CUDA-enabled PyTorch build and verify the NVIDIA driver.')
+    device = torch.device(requested)
+    if device.type not in ('cpu', 'cuda'):
+        raise ValueError('strict ECHO-CIL currently supports cpu and cuda')
     return device
 
 
 def amp_context(device: torch.device, enabled: bool):
-    if enabled:
-        return torch.autocast(device_type='cuda', dtype=torch.float16)
-    return nullcontext()
+    return (torch.autocast('cuda', dtype=torch.float16)
+            if enabled and device.type == 'cuda' else nullcontext())
 
 
-def loader_options(device: torch.device, num_workers: int):
-    options = {'num_workers': num_workers,
-               'pin_memory': device.type == 'cuda'}
-    if num_workers > 0:
+def loader_options(device: torch.device, workers: int) -> dict:
+    options = {'num_workers': workers, 'pin_memory': device.type == 'cuda'}
+    if workers:
         options['persistent_workers'] = True
     return options
 
 
-def to_device(batch, device, non_blocking=False):
-    tensors = {}
-    for key, value in batch.items():
-        if not isinstance(value, np.ndarray):
-            continue
-        tensor = torch.from_numpy(value)
-        # collate_numpy intentionally returns NumPy arrays.  Pin the completed
-        # batch here so CUDA copies can overlap with compute.
-        if non_blocking and not tensor.is_pinned():
-            tensor = tensor.pin_memory()
-        tensors[key] = tensor.to(device, non_blocking=non_blocking)
-    return tensors
+def to_device(raw: Dict[str, np.ndarray], device: torch.device) -> Dict[str, Tensor]:
+    result = {}
+    for key in ('x', 'order', 'quality', 'y', 'rpm'):
+        tensor = torch.from_numpy(raw[key])
+        result[key] = tensor.to(device, non_blocking=device.type == 'cuda')
+    return result
 
 
-def balanced_sampler(dataset, old_classes, new_classes):
-    """Balance classes and, during increments, old/new sample mass."""
-    labels = [int(dataset[i]['y']) for i in range(len(dataset))]
-    counts = Counter(labels)
-    old_set, new_set = set(old_classes), set(new_classes)
-    weights = []
-    for y in labels:
-        if old_set:
-            group_classes = old_set if y in old_set else new_set
-            weight = 0.5 / max(1, len(group_classes)) / counts[y]
-        else:
-            weight = 1.0 / max(1, len(new_set)) / counts[y]
-        weights.append(weight)
-    return WeightedRandomSampler(torch.as_tensor(weights, dtype=torch.double),
-                                 num_samples=len(weights), replacement=True)
+def make_loader(dataset: DictDataset, old_classes: Sequence[int],
+                new_classes: Sequence[int], batch_size: int, seed: int,
+                device: torch.device, workers: int) -> tuple[DataLoader, GroupBalancedBatchSampler]:
+    sampler = GroupBalancedBatchSampler(
+        dataset, old_classes, new_classes, batch_size, seed)
+    loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_numpy,
+                        **loader_options(device, workers))
+    return loader, sampler
+
+
+def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
+               diagnostics: dict, old_classes: Sequence[int],
+               new_classes: Sequence[int], competition_margin: float,
+               lambda_competition: float, lambda_amplitude: float,
+               base_stage: bool = False):
+    targets = model.classifier.target_indices(batch['y'])
+    losses = nn.functional.cross_entropy(logits, targets, reduction='none')
+    if base_stage:
+        sample_weights = torch.ones_like(losses)
+    else:
+        total_classes = len(old_classes) + len(new_classes)
+        old_weight = 2.0 * len(old_classes) / total_classes
+        new_weight = 2.0 * len(new_classes) / total_classes
+        old_mask = torch.zeros_like(batch['y'], dtype=torch.bool)
+        for label in old_classes:
+            old_mask |= batch['y'] == label
+        sample_weights = torch.where(
+            old_mask, losses.new_tensor(old_weight), losses.new_tensor(new_weight))
+    ce = (losses * sample_weights).mean()
+    if base_stage:
+        return ce, {'ce': float(ce.detach()), 'competition': 0.0, 'amplitude': 0.0}
+
+    class_positions = {label: index for index, label in enumerate(model.class_ids)}
+    competition = []
+    for row, label, weight in zip(logits, batch['y'].tolist(), sample_weights):
+        opposite = new_classes if int(label) in old_classes else old_classes
+        opposite_indices = torch.as_tensor(
+            [class_positions[value] for value in opposite],
+            device=logits.device, dtype=torch.long)
+        true_index = class_positions[int(label)]
+        competition.append(weight * torch.relu(
+            logits.new_tensor(competition_margin)
+            + row[opposite_indices].max() - row[true_index]))
+    competition_loss = torch.stack(competition).mean()
+    amplitude = diagnostics['current_delta'].pow(2).sum(dim=1).mean()
+    total = ce + lambda_competition * competition_loss + lambda_amplitude * amplitude
+    return total, {
+        'ce': float(ce.detach()),
+        'competition': float(competition_loss.detach()),
+        'amplitude': float(amplitude.detach()),
+    }
+
+
+def train_epochs(model: ECHOModel, loader: DataLoader,
+                 sampler: GroupBalancedBatchSampler, parameters: Iterable[nn.Parameter],
+                 epochs: int, device: torch.device, use_amp: bool, lr: float,
+                 weight_decay: float, old_classes: Sequence[int],
+                 new_classes: Sequence[int], competition_margin: float,
+                 lambda_competition: float, lambda_amplitude: float,
+                 enabled_current: Optional[Iterable[int]] = None,
+                 base_stage: bool = False) -> tuple[int, List[dict]]:
+    parameters = [parameter for parameter in parameters if parameter.requires_grad]
+    if epochs <= 0 or not parameters:
+        return 0, []
+    optimizer = torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, epochs), eta_min=lr * 0.01)
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    history, steps = [], 0
+    for epoch in range(epochs):
+        sampler.set_epoch(epoch)
+        model.train()
+        running = {'loss': 0.0, 'ce': 0.0, 'competition': 0.0, 'amplitude': 0.0}
+        batches = 0
+        for raw in loader:
+            batch = to_device(raw, device)
+            optimizer.zero_grad(set_to_none=True)
+            with amp_context(device, use_amp):
+                logits, _, diagnostics = model(
+                    batch['x'], batch['order'], batch['quality'], batch['rpm'],
+                    enabled_current=enabled_current)
+                loss, parts = loss_terms(
+                    model, logits, batch, diagnostics, old_classes, new_classes,
+                    competition_margin, lambda_competition, lambda_amplitude,
+                    base_stage=base_stage)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(parameters, 5.0)
+                scaler.step(optimizer); scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters, 5.0)
+                optimizer.step()
+            running['loss'] += float(loss.detach())
+            for key, value in parts.items():
+                running[key] += value
+            batches += 1; steps += 1
+        scheduler.step()
+        history.append({
+            'epoch': epoch + 1,
+            **{key: value / max(1, batches) for key, value in running.items()},
+            'lr': optimizer.param_groups[0]['lr'],
+        })
+    return steps, history
 
 
 @torch.no_grad()
-def restore_old_rows(model, old_model):
-    """Keep old classifier and router rows exactly immutable."""
-    if old_model is None:
-        return
-    n_classes = old_model.num_classes
-    n_experts = len(old_model.experts)
-    model.classifier.weight[:n_classes].copy_(old_model.classifier.weight)
-    model.classifier.bias[:n_classes].copy_(old_model.classifier.bias)
-    model.expert_gate.weight[:n_experts].copy_(old_model.expert_gate.weight)
-    model.expert_gate.bias[:n_experts].copy_(old_model.expert_gate.bias)
-
-
-@torch.no_grad()
-def extract_features(model, dataset, device, batch_size=256, num_workers=0):
-    """Extract frozen features in FP32 for reproducible head selection."""
+def extract_representations(model: ECHOModel, dataset, device: torch.device,
+                            batch_size: int, workers: int):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         collate_fn=collate_numpy,
-                        **loader_options(device, num_workers))
+                        **loader_options(device, workers))
     model.eval(); features, labels = [], []
     for raw in loader:
-        b = to_device(raw, device, non_blocking=device.type == 'cuda')
-        # Deliberately do not use autocast: the final errors are boundary cases
-        # where FP16 rounding can change the predicted class.
-        _, z = model(b['x'], b['order'], b['quality'])
-        features.append(z.detach().float().cpu())
-        labels.append(b['y'].detach().cpu())
-    return torch.cat(features).to(torch.float64), torch.cat(labels)
-
-
-def fit_logistic_head(z, y, num_classes, weight_decay, class_balanced,
-                      max_iter=200):
-    """Fit one deterministic convex candidate and return raw-space weights."""
-    mean = z.mean(dim=0)
-    std = z.std(dim=0).clamp_min(1e-5)
-    standardized = (z - mean) / std
-    head = nn.Linear(z.shape[1], num_classes, dtype=torch.float64)
-    nn.init.zeros_(head.weight); nn.init.zeros_(head.bias)
-    optimizer = torch.optim.LBFGS(
-        head.parameters(), lr=1.0, max_iter=max_iter,
-        tolerance_grad=1e-10, tolerance_change=1e-12,
-        line_search_fn='strong_wolfe')
-
-    sample_weights = None
-    if class_balanced:
-        counts = torch.bincount(y, minlength=num_classes).to(torch.float64)
-        class_weights = counts.sum() / counts.clamp_min(1.0)
-        class_weights = class_weights / class_weights.mean()
-        sample_weights = class_weights[y]
-
-    def closure():
-        optimizer.zero_grad()
-        losses = nn.functional.cross_entropy(
-            head(standardized), y, reduction='none')
-        loss = ((losses * sample_weights).mean()
-                if sample_weights is not None else losses.mean())
-        loss = loss + 0.5 * float(weight_decay) * head.weight.pow(2).sum()
-        loss.backward()
-        return loss
-
-    optimizer.step(closure)
-    with torch.no_grad():
-        raw_weight = head.weight / std.unsqueeze(0)
-        raw_bias = head.bias - (head.weight * mean.unsqueeze(0)
-                                / std.unsqueeze(0)).sum(dim=1)
-    return raw_weight, raw_bias
+        batch = to_device(raw, device)
+        z, _ = model.representation(
+            batch['x'], batch['order'], batch['quality'], batch['rpm'])
+        features.append(z.float().cpu()); labels.append(batch['y'].cpu())
+    return torch.cat(features), torch.cat(labels)
 
 
 @torch.no_grad()
-def score_head(weight, bias, z, y, classes, old_classes):
-    pred = (z @ weight.t() + bias).argmax(dim=1)
-    per_class = {}
-    for c in classes:
-        mask = y == c
-        per_class[c] = float((pred[mask] == y[mask]).double().mean())
-    new_classes = [c for c in classes if c not in old_classes]
-    group_mean = lambda cs: float(np.mean([per_class[c] for c in cs])) if cs else 0.0
-    old_acc = group_mean(old_classes)
-    new_acc = group_mean(new_classes)
-    macro = group_mean(classes)
-    overall = float((pred == y).double().mean())
-    metrics = {'overall': overall, 'macro': macro, 'old': old_acc,
-               'new': new_acc, 'worst_class': min(per_class.values())}
-    # Protect both sides of class-incremental learning first, then macro and
-    # worst-class performance. Test labels are never consulted here.
-    score = (min(old_acc, new_acc), macro, metrics['worst_class'], overall)
-    return score, metrics
+def initialize_new_head(model: ECHOModel, teacher: ECHOModel, head: nn.Linear,
+                        dataset, new_classes: Sequence[int], device: torch.device,
+                        batch_size: int, workers: int) -> None:
+    features, labels = extract_representations(
+        teacher, dataset, device, batch_size, workers)
+    old_weight, _ = teacher.classifier.weight_bias()
+    target_norm = old_weight.detach().float().norm(dim=1).median().cpu()
+    rows = []
+    for label in new_classes:
+        mean = features[labels == label].mean(dim=0)
+        rows.append(target_norm * mean / mean.norm().clamp_min(1e-12))
+    head.weight.copy_(torch.stack(rows).to(head.weight.device))
+    head.bias.zero_()
 
 
-def calibrate_classifier(model, train_dataset, validation_dataset, classes,
-                         old_classes, device, batch_size=256,
-                         weight_decays=(1e-4,), max_iter=200, num_workers=0):
-    """Select the final linear head using validation data only.
-
-    Candidates include the SGD head plus balanced and ordinary logistic heads
-    across several regularization strengths. Only the selected linear matrix
-    is retained, so inference cost remains unchanged.
-    """
-    if not weight_decays or len(train_dataset) == 0:
-        return {'method': 'disabled'}
-    train_z, train_y = extract_features(
-        model, train_dataset, device, batch_size, num_workers)
-    val_z, val_y = extract_features(
-        model, validation_dataset, device, batch_size, num_workers)
-
-    original_weight = model.classifier.weight.detach().cpu().to(torch.float64)
-    original_bias = model.classifier.bias.detach().cpu().to(torch.float64)
-    best_score, best_metrics = score_head(
-        original_weight, original_bias, val_z, val_y, classes, old_classes)
-    best = {'method': 'sgd', 'weight_decay': None,
-            'class_balanced': False, **best_metrics}
-    best_weight, best_bias = original_weight, original_bias
-
-    for class_balanced in (True, False):
-        for weight_decay in weight_decays:
-            weight, bias = fit_logistic_head(
-                train_z, train_y, model.num_classes, weight_decay,
-                class_balanced, max_iter=max_iter)
-            candidate_score, metrics = score_head(
-                weight, bias, val_z, val_y, classes, old_classes)
-            if candidate_score > best_score:
-                best_score = candidate_score
-                best_weight, best_bias = weight, bias
-                best = {'method': 'logistic',
-                        'weight_decay': float(weight_decay),
-                        'class_balanced': class_balanced, **metrics}
-
-    with torch.no_grad():
-        model.classifier.weight.copy_(best_weight.to(
-            device=device, dtype=model.classifier.weight.dtype))
-        model.classifier.bias.copy_(best_bias.to(
-            device=device, dtype=model.classifier.bias.dtype))
-    return best
+def _perturbed_item(item: dict, physics_stats: dict, variant: int) -> dict:
+    x = np.asarray(item['x'], dtype=np.float32).copy()
+    rpm = float(item['rpm'])
+    if variant == 1:
+        rng = np.random.default_rng(int(item['sample_id']) & 0xFFFFFFFF)
+        power = float(np.mean(x.astype(np.float64) ** 2))
+        noise = rng.normal(0.0, math.sqrt(power / 1000.0), size=x.shape)
+        x = (x + noise).astype(np.float32)
+    elif variant == 2:
+        rpm *= 0.99
+    elif variant == 3:
+        rpm *= 1.01
+    order, quality = physics_features(x, rpm, physics_stats)
+    enriched = dict(item)
+    enriched.update({'x': x, 'rpm': rpm, 'order': order, 'quality': quality})
+    return enriched
 
 
 @torch.no_grad()
-def evaluate(model, dataset, classes, device, old_classes=None, batch_size=128,
-             use_amp=False, num_workers=0):
+def teacher_replay_views(teacher: ECHOModel, old_items: Sequence[dict],
+                         physics_stats: dict, device: torch.device,
+                         batch_size: int, workers: int):
+    all_logits = []
+    labels = torch.as_tensor([int(item['y']) for item in old_items])
+    for variant in range(4):
+        items = [_perturbed_item(item, physics_stats, variant)
+                 for item in old_items]
+        loader = DataLoader(DictDataset(items, physics_stats),
+                            batch_size=batch_size, shuffle=False,
+                            collate_fn=collate_numpy,
+                            **loader_options(device, workers))
+        logits = []
+        teacher.eval()
+        for raw in loader:
+            batch = to_device(raw, device)
+            output, _, _ = teacher(
+                batch['x'], batch['order'], batch['quality'], batch['rpm'])
+            logits.append(output.float().cpu())
+        all_logits.append(torch.cat(logits))
+    return torch.stack(all_logits), labels
+
+
+@torch.no_grad()
+def predict_global(model: ECHOModel, dataset, device: torch.device,
+                   batch_size: int, workers: int):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         collate_fn=collate_numpy,
-                        **loader_options(device, num_workers))
-    model.eval(); hit = total = 0; per = {c: [0, 0] for c in classes}
-    class_index = {c: i for i, c in enumerate(classes)}
-    confusion = np.zeros((len(classes), len(classes)), dtype=np.int64)
+                        **loader_options(device, workers))
+    model.eval(); predictions, labels = [], []
+    class_ids = torch.as_tensor(model.class_ids)
     for raw in loader:
-        b = to_device(raw, device, non_blocking=device.type == 'cuda')
-        with amp_context(device, use_amp):
-            logits, _ = model(b['x'], b['order'], b['quality'])
-        pred = logits.argmax(1).cpu().numpy(); y = b['y'].cpu().numpy()
-        hit += int((pred == y).sum()); total += len(y)
-        for p, t in zip(pred, y):
-            per[int(t)][0] += int(p == t); per[int(t)][1] += 1
-            if int(p) in class_index:
-                confusion[class_index[int(t)], class_index[int(p)]] += 1
-    old_classes = old_classes or []
-    new_classes = [c for c in classes if c not in old_classes]
-    mean = lambda cs: float(np.mean([per[c][0] / max(1, per[c][1]) for c in cs])) if cs else 0.0
-    return {'overall': hit / max(1, total), 'macro': mean(classes),
-            'old': mean(old_classes), 'new': mean(new_classes),
-            'per_class': {str(c): per[c][0] / max(1, per[c][1]) for c in classes},
-            'confusion': confusion.tolist()}
+        batch = to_device(raw, device)
+        logits, _, _ = model(
+            batch['x'], batch['order'], batch['quality'], batch['rpm'])
+        predictions.append(class_ids[logits.argmax(dim=1).cpu()])
+        labels.append(batch['y'].cpu())
+    return torch.cat(predictions), torch.cat(labels)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    # PyCharm 右键运行时通常不会自动填写命令行参数，因此默认读取
-    # 当前工作目录下的 echo_cil_processed；命令行仍可通过 --data 覆盖。
-    ap.add_argument('--data', type=Path, default=Path('echo_cil_processed'))
-    ap.add_argument('--output', type=Path, default=Path('runs/echo_cil'))
-    ap.add_argument('--epochs', type=int, default=10); ap.add_argument('--batch-size', type=int, default=64)
-    ap.add_argument('--lr', type=float, default=1e-3); ap.add_argument('--seed', type=int, default=2027)
-    ap.add_argument('--weight-decay', type=float, default=1e-4)
-    ap.add_argument('--temperature', type=float, default=2.0)
-    ap.add_argument('--kd-weight', type=float, default=0.5)
-    ap.add_argument('--guard-strength', type=float, default=1.0)
-    ap.add_argument('--calibration-weight-decay', type=float, default=1e-4,
-                    help='preferred final calibration strength; <0 disables it')
-    ap.add_argument('--calibration-grid', type=float, nargs='+',
-                    default=[1e-5, 1e-4, 1e-3],
-                    help='regularization candidates selected on validation')
-    ap.add_argument('--calibration-max-iter', type=int, default=200)
-    ap.add_argument('--memory-mb', type=int, default=32)
-    ap.add_argument('--device', default='auto',
-                    help='auto, cpu, cuda, cuda:0, ... (default: auto)')
-    ap.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True,
-                    help='use CUDA mixed precision (default: enabled on CUDA)')
-    ap.add_argument('--num-workers', type=int, default=0,
-                    help='DataLoader worker processes; 0 is safest on Windows')
-    ap.add_argument('--deterministic', action='store_true',
-                    help='prefer deterministic CUDA algorithms over speed')
-    args = ap.parse_args()
+def conflict_groups(model: ECHOModel, dataset, old_classes: Sequence[int],
+                    new_classes: Sequence[int], device: torch.device,
+                    batch_size: int, workers: int, maximum: int = 2):
+    predictions, labels = predict_global(
+        model, dataset, device, batch_size, workers)
+    scores = {}
+    for old in old_classes:
+        for new in new_classes:
+            old_mask, new_mask = labels == old, labels == new
+            old_to_new = float((predictions[old_mask] == new).float().mean())
+            new_to_old = float((predictions[new_mask] == old).float().mean())
+            scores[(old, new)] = 0.5 * (old_to_new + new_to_old)
+    ranked_new = sorted(
+        new_classes,
+        key=lambda new: (-max(scores[(old, new)] for old in old_classes), new))
+    if max(scores.values(), default=0.0) <= 0.0:
+        return [list(new_classes)], scores
+    groups = []
+    for new in ranked_new[:maximum]:
+        old_ranked = sorted(old_classes,
+                            key=lambda old: (-scores[(old, new)], old))
+        conflicts = [old for old in old_ranked if scores[(old, new)] > 0][:2]
+        group = [new] + conflicts
+        if group not in groups:
+            groups.append(group)
+    return groups or [list(new_classes)], scores
+
+
+@torch.no_grad()
+def evaluate(model: ECHOModel, dataset, active_classes: Sequence[int],
+             task_groups: Sequence[Sequence[int]], device: torch.device,
+             batch_size: int, workers: int) -> dict:
+    predictions, labels = predict_global(
+        model, dataset, device, batch_size, workers)
+    per_class = {}
+    confusion = np.zeros((len(active_classes), len(active_classes)), dtype=np.int64)
+    position = {label: index for index, label in enumerate(active_classes)}
+    for label in active_classes:
+        mask = labels == label
+        per_class[str(label)] = float((predictions[mask] == labels[mask]).float().mean())
+    for predicted, target in zip(predictions.tolist(), labels.tolist()):
+        confusion[position[target], position[predicted]] += 1
+    macro = lambda values: float(np.mean([per_class[str(v)] for v in values])) if values else 0.0
+    old_classes = [value for group in task_groups[:-1] for value in group]
+    new_classes = list(task_groups[-1])
+    old_acc, new_acc = macro(old_classes), macro(new_classes)
+    harmonic = (2.0 * old_acc * new_acc / max(old_acc + new_acc, 1e-12)
+                if old_classes else new_acc)
+    return {
+        'overall': float((predictions == labels).float().mean()),
+        'macro': macro(active_classes), 'old': old_acc, 'new': new_acc,
+        'old_new_harmonic': harmonic, 'per_class': per_class,
+        'task_macro': [macro(group) for group in task_groups],
+        'confusion': confusion.tolist(),
+    }
+
+
+@torch.no_grad()
+def mechanism_metrics(model: ECHOModel, dataset, device: torch.device,
+                      batch_size: int, workers: int) -> dict:
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        collate_fn=collate_numpy,
+                        **loader_options(device, workers))
+    model.eval(); gammas, scales = [], [[], [], []]
+    gates: List[List[Tensor]] = [[] for _ in model.experts]
+    residual_norms = []
+    for raw in loader:
+        batch = to_device(raw, device)
+        _, _, diagnostics = model(
+            batch['x'], batch['order'], batch['quality'], batch['rpm'])
+        gammas.append(diagnostics['gamma'].float().cpu())
+        for index, alpha in enumerate(diagnostics['scale_weights']):
+            scales[index].append(alpha.float().cpu())
+        for index, gate in enumerate(diagnostics['expert_gates']):
+            gates[index].append(gate.float().cpu())
+        residual_norms.append(
+            diagnostics['current_delta'].float().norm(dim=1).cpu())
+    gamma = torch.cat(gammas)
+    scale_metrics = []
+    for values in scales:
+        alpha = torch.cat(values)
+        entropy = -(alpha * torch.log(alpha.clamp_min(1e-12))).sum(dim=1)
+        scale_metrics.append({
+            'mean': alpha.mean(dim=0).tolist(),
+            'mean_entropy': float(entropy.mean()),
+            'sample_variance': alpha.var(dim=0, unbiased=False).tolist(),
+        })
+    return {
+        'gamma_mean': float(gamma.mean()),
+        'gamma_std': float(gamma.std(unbiased=False)),
+        'scale_blocks': scale_metrics,
+        'expert_gate_mean': [float(torch.cat(values).mean()) if values else 0.0
+                             for values in gates],
+        'current_residual_norm_mean': float(torch.cat(residual_norms).mean()),
+    }
+
+
+@torch.no_grad()
+def capture_rate(previous: ECHOModel, current: ECHOModel, dataset,
+                 new_classes: Sequence[int], device: torch.device,
+                 batch_size: int, workers: int) -> float:
+    previous_prediction, labels = predict_global(
+        previous, dataset, device, batch_size, workers)
+    current_prediction, _ = predict_global(
+        current, dataset, device, batch_size, workers)
+    denominator = previous_prediction == labels
+    if not denominator.any():
+        return 0.0
+    new_mask = torch.zeros_like(current_prediction, dtype=torch.bool)
+    for label in new_classes:
+        new_mask |= current_prediction == label
+    return float((denominator & new_mask).sum() / denominator.sum())
+
+
+def experiment_summary(stages: Sequence[dict]) -> dict:
+    macros = [stage['test']['macro'] for stage in stages]
+    final = stages[-1]['test']['task_macro']
+    forgetting, backward = [], []
+    for task in range(len(stages) - 1):
+        history = [stages[stage]['test']['task_macro'][task]
+                   for stage in range(task, len(stages) - 1)]
+        forgetting.append(max(history) - final[task])
+        backward.append(final[task] - stages[task]['test']['task_macro'][task])
+    return {
+        'average_incremental_accuracy': float(np.mean(macros)),
+        'final_macro_accuracy': macros[-1],
+        'forgetting': float(np.mean(forgetting)) if forgetting else None,
+        'backward_transfer': float(np.mean(backward)) if backward else None,
+    }
+
+
+def save_checkpoint(path: Path, model: ECHOModel, stage: int,
+                    configuration: dict) -> None:
+    torch.save({
+        'stage': stage, 'model': model.state_dict(),
+        'architecture': model.architecture_metadata(),
+        'configuration': configuration,
+        'torch_rng_state': torch.get_rng_state(),
+        'numpy_rng_state': np.random.get_state(),
+        'python_rng_state': random.getstate(),
+    }, path)
+
+
+def main() -> None:
+    default_config = Path(__file__).resolve().parent / 'echo_cil_config.json'
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument('--config', type=Path, default=default_config)
+    bootstrap_args, _ = bootstrap.parse_known_args()
+    config_values = {}
+    if bootstrap_args.config.exists():
+        config_values = json.loads(
+            bootstrap_args.config.read_text(encoding='utf-8'))
+
+    parser = argparse.ArgumentParser(parents=[bootstrap])
+    parser.add_argument('--data', type=Path, default=Path('echo_cil_processed'))
+    parser.add_argument('--output', type=Path, default=Path('runs/echo_cil_strict'))
+    parser.add_argument('--order', choices=sorted(ORDERS),
+                        default=config_values.get('order', 'O0'))
+    parser.add_argument('--seed', type=int, default=config_values.get('seed', 0))
+    parser.add_argument('--batch-size', type=int,
+                        default=config_values.get('batch_size', 64))
+    parser.add_argument('--base-epochs', type=int,
+                        default=config_values.get('base_epochs', 60))
+    parser.add_argument('--head-warmup-epochs', type=int,
+                        default=config_values.get('head_warmup_epochs', 4))
+    parser.add_argument('--expert-warmup-epochs', type=int,
+                        default=config_values.get('expert_group_warmup_epochs', 2))
+    parser.add_argument('--incremental-epochs', type=int,
+                        default=config_values.get('incremental_epochs', 30))
+    parser.add_argument('--lr', type=float, default=config_values.get('lr', 1e-3))
+    parser.add_argument('--weight-decay', type=float,
+                        default=config_values.get('weight_decay', 1e-4))
+    parser.add_argument('--competition-margin', type=float,
+                        default=config_values.get('competition_margin', 0.5))
+    parser.add_argument('--lambda-competition', type=float,
+                        default=config_values.get('lambda_competition', 0.1))
+    parser.add_argument('--lambda-amplitude', type=float,
+                        default=config_values.get('lambda_amplitude', 1e-4))
+    parser.add_argument('--memory-bytes', type=int,
+                        default=config_values.get('memory_budget_bytes', 512 * 1024))
+    parser.add_argument('--experts-per-stage', type=int,
+                        default=config_values.get('experts_per_stage_max', 2))
+    parser.add_argument('--expert-limit', type=int,
+                        default=config_values.get('experts_total_max', 4))
+    parser.add_argument('--device', default='auto')
+    parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--deterministic', action='store_true')
+    args = parser.parse_args()
+
     if not args.data.exists():
-        # Support both layouts: scripts/data at repository root, or inside
-        # the CWRU轴承数据 subdirectory opened by PyCharm.
-        candidates = [Path(__file__).resolve().parent / args.data,
-                      Path(__file__).resolve().parent / 'CWRU轴承数据' / args.data]
-        for candidate in candidates:
-            if candidate.exists():
-                args.data = candidate
-                break
+        candidate = Path(__file__).resolve().parent / args.data
+        if candidate.exists():
+            args.data = candidate
     if not args.data.exists():
-        raise FileNotFoundError(f'Processed data directory not found: {args.data}')
+        raise FileNotFoundError(f'processed data not found: {args.data}')
+    physics_stats = load_physics_stats(args.data)
+    order = ORDERS[args.order]
+    if list(physics_stats['source_classes']) != order[0]:
+        raise ValueError(
+            f'normalization source classes {physics_stats["source_classes"]} '
+            f'do not match {args.order} base classes {order[0]}; regenerate data '
+            f'with --base-classes {" ".join(map(str, order[0]))}')
+    if args.batch_size % 2:
+        raise ValueError('--batch-size must be even')
     if args.num_workers < 0:
-        raise ValueError('--num-workers must be >= 0')
+        raise ValueError('--num-workers must be non-negative')
+
     device = resolve_device(args.device)
     use_amp = bool(args.amp and device.type == 'cuda')
     seed_everything(args.seed)
@@ -313,133 +489,218 @@ def main():
         if args.deterministic:
             torch.use_deterministic_algorithms(True, warn_only=True)
         torch.set_float32_matmul_precision('high')
-        print(f'Using CUDA device: {torch.cuda.get_device_name(device)}; '
-              f'AMP={use_amp}; workers={args.num_workers}')
+        print(f'Using CUDA: {torch.cuda.get_device_name(device)}; AMP={use_amp}')
     else:
-        print(f'Using device: {device}; AMP=False; workers={args.num_workers}')
+        print('Using CPU; AMP=False')
     args.output.mkdir(parents=True, exist_ok=True)
-    order = [[0,1,2,3], [4,5,6], [7,8,9]]
-    model = ECHOModel(num_classes=4).to(device); memory = ReplayBuffer(args.memory_mb * 1024 * 1024, args.seed)
+    configuration = vars(args).copy()
+    configuration['data'] = str(args.data)
+    configuration['output'] = str(args.output)
+    configuration['task_order'] = order
+    if args.config.exists():
+        configuration['config_sha256'] = hashlib.sha256(
+            args.config.read_bytes()).hexdigest()
+    (args.output / 'configuration.json').write_text(
+        json.dumps(configuration, ensure_ascii=False, indent=2, default=str),
+        encoding='utf-8')
+
+    model = ECHOModel(order[0], expert_limit=args.expert_limit).to(device)
+    memory = ReplayBuffer(args.memory_bytes, args.seed)
     stage_results = []
+
     for stage, new_classes in enumerate(order):
-        # Snapshot the actual previous-stage model before changing its expert
-        # count or classifier size.  The former implementation copied after
-        # expansion, so old_model.num_classes included the new random rows and
-        # those rows were reset after every epoch.
-        old_model = model.frozen_copy() if stage > 0 else None
-        old_num_classes = old_model.num_classes if old_model is not None else 0
-        if stage > 0:
-            model.add_expert()
-            model.expand_classes(max(new_classes) + 1)
-        active = [c for cs in order[:stage + 1] for c in cs]
-        old_classes = [c for cs in order[:stage] for c in cs]
-        new_ds = EchoCILDataset(args.data, 'train', new_classes)
-        val_ds = EchoCILDataset(args.data, 'val', active)
-        test_ds = EchoCILDataset(args.data, 'test', active)
-        # At incremental stages, only new-class data plus the fixed-budget
-        # memory are visible.  This is the actual class-incremental protocol.
+        stage_started = time.perf_counter()
+        if device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats(device)
+        active_classes = [label for group in order[:stage + 1] for label in group]
+        old_classes = [label for group in order[:stage] for label in group]
+        new_dataset = EchoCILDataset(args.data, 'train', new_classes)
+        new_items = [new_dataset[index] for index in range(len(new_dataset))]
         old_items = memory.all()
-        new_items = [new_ds[i] for i in range(len(new_ds))]
-        train_ds = DictDataset(old_items + new_items)
-        guard = SubspaceGuard(rank=16, strength=args.guard_strength)
-        if old_model is not None and old_items:
-            old_loader = DataLoader(
-                DictDataset(old_items), batch_size=args.batch_size,
-                shuffle=False, collate_fn=collate_numpy,
-                **loader_options(device, args.num_workers))
-            with torch.no_grad():
-                features = []
-                for raw in old_loader:
-                    b = to_device(raw, device,
-                                  non_blocking=device.type == 'cuda')
-                    features.append(old_model(b['x'], b['order'], b['quality'])[1])
-                old_features = torch.cat(features)
-            guard.fit(old_features)
-        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                                      lr=args.lr, weight_decay=args.weight_decay)
-        sampler = balanced_sampler(train_ds, old_classes, new_classes)
-        loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
-                            collate_fn=collate_numpy,
-                            **loader_options(device, args.num_workers))
-        scaler = torch.amp.GradScaler('cuda') if use_amp else None
-        for epoch in range(args.epochs):
-            model.train()
-            for raw in loader:
-                b = to_device(raw, device,
-                              non_blocking=device.type == 'cuda')
-                with amp_context(device, use_amp):
-                    logits, z = model(b['x'], b['order'], b['quality'])
-                    loss = nn.functional.cross_entropy(logits, b['y'])
-                    if old_model is not None:
-                        # Replay examples are the reliable anchor for old-class
-                        # distillation and subspace protection.  Applying these
-                        # losses to unseen new classes unnecessarily blocks
-                        # plasticity.
-                        old_mask = b['y'] < old_num_classes
-                        if old_mask.any():
-                            with torch.no_grad():
-                                old_logits, old_z = old_model(
-                                    b['x'][old_mask], b['order'][old_mask],
-                                    b['quality'][old_mask])
-                            temperature = args.temperature
-                            kd = nn.functional.kl_div(
-                                nn.functional.log_softmax(
-                                    logits[old_mask, :old_num_classes]
-                                    / temperature, 1),
-                                nn.functional.softmax(old_logits / temperature, 1),
-                                reduction='batchmean') * temperature ** 2
-                            loss = loss + args.kd_weight * kd
-                            loss = loss + guard.penalty(old_z, z[old_mask])
-                optimizer.zero_grad(set_to_none=True)
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                    scaler.step(optimizer); scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                    optimizer.step()
-                # Restore after every optimizer step.  Only old rows are
-                # immutable; newly appended classifier/router rows keep their
-                # learned updates.
-                restore_old_rows(model, old_model)
-        # Consolidate only after the final increment.  Feeding an intermediate
-        # calibrated head back into the next teacher changes the representation
-        # learning trajectory and can reduce final new-class accuracy.  Final-
-        # only calibration preserves the proven incremental trajectory while
-        # removing its last classifier bias at deployment time.
-        applied_calibration = (args.calibration_weight_decay
-                               if stage == len(order) - 1 else -1.0)
-        calibration = {'method': 'not_final_stage'}
-        if applied_calibration >= 0:
-            weight_decays = list(dict.fromkeys(
-                [applied_calibration] + args.calibration_grid))
-            calibration = calibrate_classifier(
-                model, train_ds, val_ds, active, old_classes, device,
-                batch_size=max(args.batch_size, 256),
-                weight_decays=weight_decays,
-                max_iter=args.calibration_max_iter,
-                num_workers=args.num_workers)
-            print(f'Final head selected on validation: {calibration}')
-        result = evaluate(model, val_ds, active, device, old_classes,
-                          use_amp=False, num_workers=args.num_workers)
-        test_result = evaluate(model, test_ds, active, device, old_classes,
-                               use_amp=False, num_workers=args.num_workers)
-        memory_before = memory.bytes_used
-        # ReplayBuffer.update already merges existing exemplars.  Passing only
-        # this stage's new data prevents the old memory from being duplicated.
-        memory.update(new_items, active)
-        stage_results.append({'stage': stage, 'classes': active, 'val': result,
-                              'test': test_result,
-                              'device': str(device), 'amp': use_amp,
-                              'calibration_weight_decay': applied_calibration,
-                              'calibration': calibration,
-                              'memory_bytes_before': memory_before,
-                              'memory_bytes': memory.bytes_used})
-        torch.save({'stage': stage, 'model': model.state_dict(), 'classes': active}, args.output / f'stage_{stage}.pt')
-    (args.output / 'results.json').write_text(json.dumps(stage_results, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(json.dumps(stage_results, ensure_ascii=False, indent=2))
+        train_dataset = DictDataset(old_items + new_items, physics_stats)
+        val_dataset = EchoCILDataset(args.data, 'val', active_classes)
+        test_dataset = EchoCILDataset(args.data, 'test', active_classes)
+        train_loader, train_sampler = make_loader(
+            train_dataset, old_classes, new_classes, args.batch_size,
+            args.seed + stage * 1000, device, args.num_workers)
+        stage_log = {'head_warmup': [], 'expert_warmup': [], 'joint': []}
+        protection_json = {'rank': 0, 'selected_edges': [], 'candidate_edges': []}
+        conflicts_json, expert_groups, projection_max_error = {}, [], 0.0
+        previous_model = None
+
+        if stage == 0:
+            steps, history = train_epochs(
+                model, train_loader, train_sampler, model.parameters(),
+                args.base_epochs, device, use_amp, args.lr, args.weight_decay,
+                [], new_classes, args.competition_margin,
+                args.lambda_competition, args.lambda_amplitude,
+                base_stage=True)
+            stage_log['joint'] = history
+            total_steps = steps
+        else:
+            previous_model = model.frozen_copy()
+            new_head = model.begin_increment(new_classes, stage)
+            initialize_new_head(
+                model, previous_model, new_head, new_dataset, new_classes,
+                device, args.batch_size, args.num_workers)
+
+            head_steps, history = train_epochs(
+                model, train_loader, train_sampler, new_head.parameters(),
+                args.head_warmup_epochs, device, use_amp, args.lr,
+                args.weight_decay, old_classes, new_classes,
+                args.competition_margin, args.lambda_competition,
+                args.lambda_amplitude)
+            stage_log['head_warmup'] = history
+
+            replay_logits, replay_labels = teacher_replay_views(
+                previous_model, old_items, physics_stats, device,
+                args.batch_size, args.num_workers)
+            old_weight, _ = previous_model.classifier.weight_bias()
+            protection = build_protection(
+                replay_logits, replay_labels, old_classes, old_weight,
+                min_samples=5, lower_quantile=0.10)
+            protection_json = protection.to_json()
+
+            groups, conflict_scores = conflict_groups(
+                model, train_dataset, old_classes, new_classes, device,
+                args.batch_size, args.num_workers,
+                maximum=args.experts_per_stage)
+            remaining = args.expert_limit - len(model.experts)
+            groups = groups[:max(0, remaining)]
+            if not groups and remaining > 0:
+                groups = [list(new_classes)]
+            conflicts_json = {
+                f'{old}-{new}': value
+                for (old, new), value in conflict_scores.items()
+            }
+            expert_indices = [model.add_expert(protection.basis, group)
+                              for group in groups]
+            expert_groups = groups
+
+            new_head.requires_grad_(False)
+            warmup_steps = 0
+            for expert_index, group in zip(expert_indices, groups):
+                group_old = [label for label in group if label in old_classes]
+                group_new = [label for label in group if label in new_classes]
+                if not group_new:
+                    group_new = list(new_classes)
+                group_items = [item for item in old_items + new_items
+                               if int(item['y']) in group_old + group_new]
+                group_dataset = DictDataset(group_items, physics_stats)
+                group_loader, group_sampler = make_loader(
+                    group_dataset, group_old, group_new, args.batch_size,
+                    args.seed + stage * 1000 + expert_index + 101,
+                    device, args.num_workers)
+                steps, history = train_epochs(
+                    model, group_loader, group_sampler,
+                    model.experts[expert_index].parameters(),
+                    args.expert_warmup_epochs, device, use_amp, args.lr,
+                    args.weight_decay, old_classes, new_classes,
+                    args.competition_margin, args.lambda_competition,
+                    args.lambda_amplitude, enabled_current=[expert_index])
+                warmup_steps += steps
+                stage_log['expert_warmup'].append({
+                    'expert_index': expert_index, 'group': group,
+                    'epochs': history,
+                })
+
+            new_head.requires_grad_(True)
+            joint_parameters = list(new_head.parameters())
+            for expert_index in expert_indices:
+                model.experts[expert_index].requires_grad_(True)
+                joint_parameters.extend(model.experts[expert_index].parameters())
+            joint_steps, history = train_epochs(
+                model, train_loader, train_sampler, joint_parameters,
+                args.incremental_epochs, device, use_amp, args.lr,
+                args.weight_decay, old_classes, new_classes,
+                args.competition_margin, args.lambda_competition,
+                args.lambda_amplitude)
+            stage_log['joint'] = history
+            total_steps = head_steps + warmup_steps + joint_steps
+
+            if expert_indices and old_items:
+                check_dataset = DictDataset(old_items[:min(32, len(old_items))],
+                                            physics_stats)
+                # Check the exact algebra directly on deterministic residuals.
+                check_raw = collate_numpy([check_dataset[i]
+                                           for i in range(len(check_dataset))])
+                check_batch = to_device(check_raw, device)
+                model.eval()
+                with torch.no_grad():
+                    _, _, check_diag = model(
+                        check_batch['x'], check_batch['order'],
+                        check_batch['quality'], check_batch['rpm'])
+                    raw_residuals = [raw for raw, expert in zip(
+                        check_diag['raw_residuals'], model.experts)
+                        if expert.stage == stage]
+                    raw = (torch.stack(raw_residuals).sum(dim=0)
+                           if raw_residuals else check_batch['x'].new_zeros(
+                               (len(check_dataset), model.feature_dim)))
+                    projection_max_error = projection_error(
+                        protection.basis, old_weight, old_classes,
+                        protection.selected, raw)
+
+        val_result = evaluate(
+            model, val_dataset, active_classes, order[:stage + 1], device,
+            args.batch_size, args.num_workers)
+        test_result = evaluate(
+            model, test_dataset, active_classes, order[:stage + 1], device,
+            args.batch_size, args.num_workers)
+        mechanisms = mechanism_metrics(
+            model, test_dataset, device, args.batch_size, args.num_workers)
+        capture = 0.0
+        if previous_model is not None:
+            old_test = EchoCILDataset(args.data, 'test', old_classes)
+            capture = capture_rate(
+                previous_model, model, old_test, new_classes, device,
+                args.batch_size, args.num_workers)
+
+        memory.update(new_items, active_classes)
+        memory_size = memory.save(args.output / f'memory_stage_{stage}.npy')
+        checkpoint_path = args.output / f'stage_{stage}.pt'
+        save_checkpoint(checkpoint_path, model, stage, configuration)
+        model_bytes = checkpoint_path.stat().st_size
+        result = {
+            'stage': stage, 'classes': active_classes,
+            'new_classes': list(new_classes), 'val': val_result,
+            'test': test_result, 'capture_rate': capture,
+            'mechanisms': mechanisms,
+            'protection': {**protection_json,
+                           'projection_max_error': projection_max_error},
+            'conflict_scores': conflicts_json,
+            'expert_groups': expert_groups,
+            'experts_total': len(model.experts),
+            'memory_count': len(memory.all()),
+            'memory_counts': memory.counts(),
+            'memory_bytes': memory_size,
+            'model_bytes': model_bytes,
+            'optimization_steps': total_steps,
+            'training_seconds': time.perf_counter() - stage_started,
+            'peak_cuda_bytes': (torch.cuda.max_memory_allocated(device)
+                                if device.type == 'cuda' else 0),
+            'parameters_total': sum(parameter.numel()
+                                    for parameter in model.parameters()),
+            'training_log': stage_log,
+            'device': str(device), 'amp': use_amp,
+        }
+        stage_results.append(result)
+        print(json.dumps({
+            'stage': stage, 'test_macro': test_result['macro'],
+            'old': test_result['old'], 'new': test_result['new'],
+            'memory_bytes': memory_size,
+            'protection_rank': protection_json.get('rank', 0),
+        }, ensure_ascii=False))
+
+    output = {
+        'protocol': 'ECHO-CIL-strict', 'order_name': args.order,
+        'order': order, 'seed': args.seed, 'configuration': configuration,
+        'stages': stage_results, 'summary': experiment_summary(stage_results),
+    }
+    (args.output / 'results.json').write_text(
+        json.dumps(output, ensure_ascii=False, indent=2, default=str),
+        encoding='utf-8')
+    print(json.dumps(output['summary'], ensure_ascii=False, indent=2))
 
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    main()

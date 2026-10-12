@@ -1,58 +1,76 @@
-# ECHO-CIL 算法实现
+# ECHO-CIL 严格实现
 
-该目录在原仓库 `cwru_preprocess.py` 的基础上，增加了可直接训练的 Python 类增量学习实现。模型输入不是重新读取 MATLAB 文件，而是使用 `echo_cil_processed` 中的固定 shard，保证训练协议与数据处理完全一致。
+本实现按《ECHO-CIL_完整技术方案》重构，旧版 `echo_cil_processed`、旧模型检查点和旧结果不可复用。
 
-## 方法结构
+## 已实现的核心机制
 
-1. **时域分支**：一维卷积 + 三个条件膨胀残差块，膨胀率为 `[1, 3, 7]`，提取冲击瞬态和多尺度周期结构。
-2. **物理分支**：对三个频带的 Hilbert 包络阶次谱使用卷积编码，同时编码 9 维质量特征。
-3. **门控融合**：时域特征产生物理分支注入系数，形成 128 维融合表示。
-4. **低秩专家**：每个增量阶段新增一个 rank=8 的低秩专家；专家由独立 sigmoid 门控，降低新增类别对旧表示的扰动。
-5. **分类头扩展**：新阶段只增加新类行，旧类行在每轮更新后恢复冻结。
-6. **回放与保护**：固定 32 MB 类均衡回放；对旧样本特征做 SVD，保留前 16 个判别子空间方向，并对增量训练中的表示漂移加保护损失。
-7. **蒸馏**：旧模型 logits 使用温度 2 的 KL 蒸馏，抑制旧类遗忘。
-8. **验证集自动校准**：最终阶段同时训练类别平衡与普通逻辑回归头，并比较多组正则强度；只依据验证集的旧类/新类下界、宏平均和最弱类别准确率选择最终头。测试集不参与选择，最终推理仍只有一个线性分类头。
+1. 记录内连续区块60/20/20划分，边界两侧各删除一个目标窗口长度；正常记录按48 kHz审计，故障记录按12 kHz审计，再分区块重采样至12 kHz。
+2. 2048点时域输入；三频带包络阶次谱、`log(1+S)`、0--20阶256点插值；每窗反射延拓256点。
+3. 21个通用谐波查询、4头阶次距离偏置注意力，以及每频带PBR/谱熵/RPM稳定性组成的9维质量向量。
+4. 三个由谐波证据和质量门控共同控制的时域尺度块，通道为64/96/128，膨胀率为1/3/7。
+5. 时域Query、谐波证据Key/Value的跨域注意力，生成128维冻结基础特征。
+6. 可靠旧类边、最大权匹配、分类权重差SVD，以及新增专家残差的FP32前向正交投影。
+7. 训练侧旧新混淆分组；每阶段最多两个rank=8专家、总数最多四个，独立sigmoid门控。
+8. 独立冻结旧分类头，新分类行使用冻结特征类均值初始化。
+9. 精确旧/新各半采样、类别均匀重要性校正、旧新竞争间隔损失和残差幅度损失。
+10. 512 KiB波形回放，按样本ID哈希确定性选择；保存后的NumPy文件大小必须不超过预算。
 
-## 运行
+## 第一步：重新预处理
 
-在 `CWRU轴承数据` 目录执行：
-
-```bash
-pip install -r requirements_echo_cil.txt
-python train_echocil.py --data echo_cil_processed --epochs 10 --batch-size 64
-```
-
-设备选择：
+主顺序O0：
 
 ```bash
-# 自动选择：优先 CUDA，其次 MPS，最后 CPU
-python train_echocil.py --device auto
-
-# 强制使用第一张 NVIDIA GPU，并开启混合精度（默认）
-python train_echocil.py --device cuda:0 --amp
-
-# 强制使用 CPU
-python train_echocil.py --device cpu --no-amp
+python echo_cil_preprocess.py \
+  --input CWRU轴承数据/cwru_data \
+  --output echo_cil_processed \
+  --base-classes 0 1 2 3
 ```
 
-启动时会打印实际使用的设备。若指定 `--device cuda` 但当前 PyTorch
-不是 CUDA 版本、NVIDIA 驱动不可用或没有可见 GPU，程序会立即给出明确错误，
-不会悄悄退回 CPU。可用下面的命令检查环境：
+预处理会生成新的 `normalization.json`。训练程序会拒绝缺少严格物理统计量的旧数据目录。
+
+## 第二步：运行主顺序
+
+GPU：
 
 ```bash
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python train_echocil.py \
+  --data echo_cil_processed \
+  --output runs/echo_cil_strict/O0/seed_0 \
+  --order O0 \
+  --seed 0 \
+  --device cuda:0 \
+  --amp \
+  --num-workers 4
 ```
 
-输出目录默认为 `runs/echo_cil`，包含 `stage_0.pt`、`stage_1.pt`、`stage_2.pt` 和 `results.json`。
-`results.json` 的最终阶段还会记录 `calibration` 字段，包括自动选中的校准方式、正则强度以及对应验证集指标。混合精度仅用于训练，最终校准和评估固定使用 FP32，减少临界样本的数值波动。
+CPU验证：
 
-需要关闭最终校准时可传入 `--calibration-weight-decay -1`；默认会自动比较
-`1e-5、1e-4、1e-3`，通常无需手工调整。若显存足够但更看重准确率，建议保持
-`--batch-size 64`；128 的大批次更快，但本数据集上可能略微降低泛化精度。
+```bash
+python train_echocil.py --device cpu --no-amp --num-workers 0
+```
 
-## 重要实验约束
+默认参数来自 `echo_cil_config.json`：基阶段60轮，新头预热4轮，专家分组预热2轮，增量联合训练30轮，batch为64。
 
-- 阶段 0 只使用 `[0,1,2,3]`；阶段 1 只看到新增 `[4,5,6]` 和回放样本；阶段 2 只看到新增 `[7,8,9]` 和回放样本。
-- 验证集始终使用当前阶段全部已见类。
-- 不得在训练脚本中重新随机切窗或重新计算归一化统计量。
-- `record_inventory.csv` 中的 `sha256`、`preprocess_config.json` 和 `normalization.json` 应作为实验记录的一部分保存。
+## 完整5顺序×3种子实验
+
+每个类别顺序需要独立的基阶段归一化统计。批量脚本会自动为每个顺序生成独立处理目录，再运行15个配对实验：
+
+```bash
+python run_echo_cil_suite.py \
+  --input CWRU轴承数据/cwru_data \
+  --processed-root echo_cil_processed_suite \
+  --output-root runs/echo_cil_suite \
+  --device cuda:0 \
+  --num-workers 4
+```
+
+## 输出
+
+每个运行目录包含：
+
+- `configuration.json`：实际参数、类别顺序和配置哈希；
+- `stage_0.pt`、`stage_1.pt`、`stage_2.pt`：模型、架构元数据和随机状态；
+- `memory_stage_*.npy`：真实512 KiB预算内的回放；
+- `results.json`：阶段精度、AIA、遗忘、BWT、旧新调和均值、可靠边、匹配边、保护秩、投影误差、专家分组、旧类被新类抢占率和资源记录。
+
+`results.json` 是一个对象，阶段结果位于 `stages`，汇总指标位于 `summary`。

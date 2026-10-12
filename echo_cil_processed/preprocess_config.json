@@ -1,9 +1,10 @@
 {
-  "protocol": "blocked_60_20_20_with_guards",
+  "protocol_version": "ECHO-CIL-strict",
+  "split": "blocked_60_20_20_with_guards",
   "window": 2048,
   "train_stride": 1024,
   "eval_stride": 2048,
-  "guard": 2048,
+  "guard_target_samples": 2048,
   "bands_hz": [
     [
       500,
@@ -18,13 +19,35 @@
       5500
     ]
   ],
+  "filter": "Butterworth-4 SOS zero-phase",
+  "reflect_pad": 256,
   "order_grid": [
     0,
-    20,
+    20.0,
     256
   ],
-  "features": {
-    "order": "3 bands x 256",
-    "quality": 9
-  }
+  "harmonic_queries": [
+    1.0,
+    2.0,
+    3.0,
+    2.0,
+    4.0,
+    6.0,
+    0.39827999472618103,
+    0.7965599894523621,
+    1.1948399543762207,
+    2.3566999435424805,
+    4.713399887084961,
+    7.070099830627441,
+    4.713500022888184,
+    9.427000045776367,
+    14.14050006866455,
+    3.5848000049591064,
+    7.169600009918213,
+    10.754400253295898,
+    5.415200233459473,
+    10.830400466918945,
+    16.245601654052734
+  ],
+  "quality": "per-band log-PBR, normalized entropy, RPM +/-1% stability"
 }
