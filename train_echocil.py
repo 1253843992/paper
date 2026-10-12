@@ -305,12 +305,12 @@ def extract_representations(model: ECHOModel, dataset, device: torch.device,
 @torch.no_grad()
 def build_record_prototypes(model: ECHOModel, dataset, device: torch.device,
                             batch_size: int, workers: int,
-                            per_record: int = 4) -> tuple[Tensor, Tensor]:
+                            per_record: int = 0) -> tuple[Tensor, Tensor, Tensor]:
     """Build multiple temporal prototypes per class and source record/load."""
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         collate_fn=collate_numpy,
                         **loader_options(device, workers))
-    model.eval(); features, labels, records = [], [], []
+    model.eval(); features, labels, records, rpms = [], [], [], []
     for raw in loader:
         batch = to_device(raw, device)
         z, _ = model.representation(
@@ -318,41 +318,63 @@ def build_record_prototypes(model: ECHOModel, dataset, device: torch.device,
         features.append(z.float().cpu())
         labels.append(batch['y'].cpu())
         records.append(torch.from_numpy(raw['record_id']).long())
+        rpms.append(batch['rpm'].float().cpu())
     features = torch.cat(features)
     labels = torch.cat(labels)
     records = torch.cat(records)
-    vectors, vector_labels = [], []
+    rpms = torch.cat(rpms)
+    vectors, vector_labels, vector_rpms = [], [], []
     for label in sorted(set(labels.tolist())):
         label_mask = labels == label
         for record in sorted(set(records[label_mask].tolist())):
             mask = label_mask & (records == record)
             record_features = features[mask]
-            for chunk in torch.tensor_split(
-                    record_features, min(per_record, len(record_features))):
+            record_rpms = rpms[mask]
+            chunks = ([torch.arange(len(record_features))]
+                      if per_record == 1 else
+                      [torch.as_tensor([index]) for index in range(len(record_features))]
+                      if per_record == 0 else
+                      list(torch.tensor_split(
+                          torch.arange(len(record_features)),
+                          min(per_record, len(record_features)))))
+            for indices in chunks:
+                chunk = record_features[indices]
                 if len(chunk):
                     mean = chunk.mean(dim=0)
                     vectors.append(nn.functional.normalize(mean, dim=0))
                     vector_labels.append(label)
-    return torch.stack(vectors), torch.as_tensor(vector_labels, dtype=torch.long)
+                    vector_rpms.append(record_rpms[indices].mean())
+    return (torch.stack(vectors),
+            torch.as_tensor(vector_labels, dtype=torch.long),
+            torch.stack(vector_rpms))
 
 
-def tune_prototype_weight(model: ECHOModel, val_dataset,
-                          active_classes: Sequence[int], task_groups,
-                          device: torch.device, batch_size: int,
-                          workers: int, candidates: Sequence[float]) -> tuple[float, List[dict]]:
-    trials, best_weight, best_score = [], 0.0, -float('inf')
-    for weight in candidates:
-        model.set_prototype_weight(float(weight))
-        metrics = evaluate(model, val_dataset, active_classes, task_groups,
-                           device, batch_size, workers)
-        score = 0.5 * (metrics['macro'] + metrics['old_new_harmonic'])
-        trials.append({'weight': float(weight), 'score': score,
-                       'macro': metrics['macro'],
-                       'old_new_harmonic': metrics['old_new_harmonic']})
-        if score > best_score:
-            best_score, best_weight = score, float(weight)
-    model.set_prototype_weight(best_weight)
-    return best_weight, trials
+def tune_prototype_settings(model: ECHOModel, val_dataset,
+                            active_classes: Sequence[int], task_groups,
+                            device: torch.device, batch_size: int,
+                            workers: int, weights: Sequence[float],
+                            neighbors: Sequence[int],
+                            rpm_penalties: Sequence[float]) -> tuple[dict, List[dict]]:
+    trials, best, best_score = [], None, -float('inf')
+    for weight in weights:
+        for neighbor_count in neighbors:
+            for rpm_penalty in rpm_penalties:
+                model.set_prototype_weight(float(weight))
+                model.set_prototype_options(int(neighbor_count), float(rpm_penalty))
+                metrics = evaluate(model, val_dataset, active_classes, task_groups,
+                                   device, batch_size, workers)
+                score = 0.5 * (metrics['macro'] + metrics['old_new_harmonic'])
+                trial = {'weight': float(weight),
+                         'neighbors': int(neighbor_count),
+                         'rpm_penalty': float(rpm_penalty), 'score': score,
+                         'macro': metrics['macro'],
+                         'old_new_harmonic': metrics['old_new_harmonic']}
+                trials.append(trial)
+                if score > best_score:
+                    best_score, best = score, trial
+    model.set_prototype_weight(best['weight'])
+    model.set_prototype_options(best['neighbors'], best['rpm_penalty'])
+    return best, trials
 
 
 @torch.no_grad()
@@ -624,9 +646,14 @@ def main() -> None:
                         default=config_values.get('early_stopping_patience', 10))
     parser.add_argument('--prototype-weights', type=float, nargs='+',
                         default=config_values.get(
-                            'prototype_weights', [0.0, 0.25, 0.5, 0.75, 1.0]))
+                            'prototype_weights', [1.0]))
+    parser.add_argument('--prototype-neighbors', type=int, nargs='+',
+                        default=config_values.get('prototype_neighbors', [1, 3, 5]))
+    parser.add_argument('--prototype-rpm-penalties', type=float, nargs='+',
+                        default=config_values.get(
+                            'prototype_rpm_penalties', [0.0, 2.0, 5.0, 10.0]))
     parser.add_argument('--prototypes-per-record', type=int,
-                        default=config_values.get('prototypes_per_record', 4))
+                        default=config_values.get('prototypes_per_record', 0))
     parser.add_argument('--memory-bytes', type=int,
                         default=config_values.get('memory_budget_bytes', 32 * 1024 * 1024))
     parser.add_argument('--experts-per-stage', type=int,
@@ -660,8 +687,12 @@ def main() -> None:
         raise ValueError('learning rates must be positive')
     if args.kd_temperature <= 0 or args.supcon_temperature <= 0:
         raise ValueError('loss temperatures must be positive')
-    if args.prototypes_per_record <= 0:
-        raise ValueError('--prototypes-per-record must be positive')
+    if args.prototypes_per_record < 0:
+        raise ValueError('--prototypes-per-record must be non-negative')
+    if any(value <= 0 for value in args.prototype_neighbors):
+        raise ValueError('--prototype-neighbors values must be positive')
+    if any(value < 0 for value in args.prototype_rpm_penalties):
+        raise ValueError('--prototype-rpm-penalties values must be non-negative')
 
     device = resolve_device(args.device)
     use_amp = bool(args.amp and device.type == 'cuda')
@@ -871,13 +902,15 @@ def main() -> None:
             total_steps += consolidation_steps
             stage_log['consolidation'] = consolidation_history
 
-        prototype_vectors, prototype_labels = build_record_prototypes(
+        prototype_vectors, prototype_labels, prototype_rpms = build_record_prototypes(
             model, train_dataset, device, args.batch_size, 0,
             per_record=args.prototypes_per_record)
-        model.set_prototypes(prototype_vectors, prototype_labels, weight=0.0)
-        prototype_weight, prototype_trials = tune_prototype_weight(
+        model.set_prototypes(
+            prototype_vectors, prototype_labels, prototype_rpms, weight=0.0)
+        prototype_settings, prototype_trials = tune_prototype_settings(
             model, val_dataset, active_classes, order[:stage + 1], device,
-            args.batch_size, 0, args.prototype_weights)
+            args.batch_size, 0, args.prototype_weights,
+            args.prototype_neighbors, args.prototype_rpm_penalties)
 
         val_result = evaluate(
             model, val_dataset, active_classes, order[:stage + 1], device,
@@ -909,7 +942,9 @@ def main() -> None:
             'conflict_scores': conflicts_json,
             'expert_groups': expert_groups,
             'prototype_count': int(prototype_vectors.shape[0]),
-            'prototype_weight': prototype_weight,
+            'prototype_weight': prototype_settings['weight'],
+            'prototype_neighbors': prototype_settings['neighbors'],
+            'prototype_rpm_penalty': prototype_settings['rpm_penalty'],
             'prototype_trials': prototype_trials,
             'experts_total': len(model.experts),
             'memory_count': len(memory.all()),

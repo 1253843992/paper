@@ -249,7 +249,10 @@ class ECHOModel(nn.Module):
         self.classifier = IncrementalClassifier(feature_dim, base_classes)
         self.register_buffer('prototype_vectors', torch.empty(0, feature_dim))
         self.register_buffer('prototype_labels', torch.empty(0, dtype=torch.long))
+        self.register_buffer('prototype_rpms', torch.empty(0))
         self.register_buffer('prototype_weight', torch.tensor(0.0))
+        self.register_buffer('prototype_neighbors', torch.tensor(1, dtype=torch.long))
+        self.register_buffer('prototype_rpm_penalty', torch.tensor(0.0))
         self.feature_dim = feature_dim
         self.expert_rank = expert_rank
         self.expert_limit = expert_limit
@@ -305,35 +308,55 @@ class ECHOModel(nn.Module):
                 and float(self.prototype_weight) > 0.0):
             similarities = (F.normalize(z.float(), dim=1)
                             @ F.normalize(self.prototype_vectors.float(), dim=1).t())
+            if self.prototype_rpms.numel():
+                rpm_distance = ((rpm.float()[:, None]
+                                 - self.prototype_rpms.float()[None, :]).abs()
+                                / rpm.float()[:, None].clamp_min(1.0))
+                similarities = (similarities
+                                - self.prototype_rpm_penalty * rpm_distance)
             scale = self.classifier.logit_scale.exp().clamp(max=100.0)
             prototype_logits = logits.new_full(logits.shape, -1e4)
             positions = {label: index for index, label in enumerate(self.class_ids)}
             for label in self.prototype_labels.unique().tolist():
                 if int(label) in positions:
                     mask = self.prototype_labels == int(label)
+                    class_similarities = similarities[:, mask]
+                    neighbors = min(
+                        int(self.prototype_neighbors), class_similarities.shape[1])
                     prototype_logits[:, positions[int(label)]] = (
-                        scale * similarities[:, mask].max(dim=1).values)
+                        scale * class_similarities.topk(
+                            neighbors, dim=1).values.mean(dim=1))
             weight = self.prototype_weight.to(logits)
             logits = (1.0 - weight) * logits + weight * prototype_logits
         return logits, z, diagnostics
 
-    def set_prototypes(self, vectors: Tensor, labels: Tensor,
+    def set_prototypes(self, vectors: Tensor, labels: Tensor, rpms: Tensor,
                        weight: float = 0.5) -> None:
         self.prototype_vectors = vectors.detach().float().to(
             next(self.parameters()).device)
         self.prototype_labels = labels.detach().long().to(
+            next(self.parameters()).device)
+        self.prototype_rpms = rpms.detach().float().to(
             next(self.parameters()).device)
         self.prototype_weight.fill_(float(weight))
 
     def set_prototype_weight(self, weight: float) -> None:
         self.prototype_weight.fill_(float(weight))
 
+    def set_prototype_options(self, neighbors: int,
+                              rpm_penalty: float) -> None:
+        self.prototype_neighbors.fill_(int(neighbors))
+        self.prototype_rpm_penalty.fill_(float(rpm_penalty))
+
     def clear_prototypes(self) -> None:
         device = next(self.parameters()).device
         self.prototype_vectors = torch.empty(
             0, self.feature_dim, device=device)
         self.prototype_labels = torch.empty(0, dtype=torch.long, device=device)
+        self.prototype_rpms = torch.empty(0, device=device)
         self.prototype_weight.zero_()
+        self.prototype_neighbors.fill_(1)
+        self.prototype_rpm_penalty.zero_()
 
     def freeze_base(self) -> None:
         for module in (self.evidence, self.quality_gate, self.time, self.fusion):
@@ -384,4 +407,6 @@ class ECHOModel(nn.Module):
             'expert_rank': self.expert_rank,
             'prototype_count': int(self.prototype_vectors.shape[0]),
             'prototype_weight': float(self.prototype_weight),
+            'prototype_neighbors': int(self.prototype_neighbors),
+            'prototype_rpm_penalty': float(self.prototype_rpm_penalty),
         }
