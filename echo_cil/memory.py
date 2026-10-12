@@ -67,6 +67,30 @@ class ReplayBuffer:
             approximate -= 1
         return 0
 
+    def _stratified_select(self, candidates: Sequence[dict], quota: int) -> List[dict]:
+        """Deterministically cover records/load conditions before taking repeats."""
+        by_record: Dict[int, List[dict]] = defaultdict(list)
+        for item in candidates:
+            by_record[int(item['record_id'])].append(item)
+        for record in by_record:
+            by_record[record].sort(key=self._priority)
+        selected: List[dict] = []
+        depth = 0
+        records = sorted(by_record)
+        while len(selected) < quota:
+            added = False
+            for record in records:
+                values = by_record[record]
+                if depth < len(values):
+                    selected.append(values[depth])
+                    added = True
+                    if len(selected) == quota:
+                        break
+            if not added:
+                break
+            depth += 1
+        return selected
+
     def update(self, new_candidates: Sequence[dict],
                active_classes: Sequence[int]) -> None:
         classes = list(active_classes)
@@ -82,8 +106,8 @@ class ReplayBuffer:
         self.items = defaultdict(list)
         for position, label in enumerate(classes):
             quota = base + int(position < remainder)
-            ranked = sorted(pool[label].values(), key=self._priority)
-            self.items[label] = ranked[:quota]
+            self.items[label] = self._stratified_select(
+                list(pool[label].values()), quota)
 
         # The dtype and NumPy header are both included in the check.
         while self.bytes_used > self.byte_budget:

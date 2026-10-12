@@ -192,18 +192,24 @@ class ProtectedExpert(nn.Module):
 
 
 class IncrementalClassifier(nn.Module):
-    def __init__(self, feature_dim: int, base_classes: Sequence[int]):
+    def __init__(self, feature_dim: int, base_classes: Sequence[int],
+                 initial_scale: float = 16.0):
         super().__init__()
         self.feature_dim = feature_dim
         self.heads = nn.ModuleList([nn.Linear(feature_dim, len(base_classes))])
         self.class_chunks: List[List[int]] = [list(map(int, base_classes))]
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(initial_scale)))
 
     @property
     def class_ids(self) -> List[int]:
         return [label for chunk in self.class_chunks for label in chunk]
 
     def forward(self, z: Tensor) -> Tensor:
-        return torch.cat([head(z) for head in self.heads], dim=1)
+        features = F.normalize(z.float(), dim=1)
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        chunks = [scale * F.linear(features, F.normalize(head.weight.float(), dim=1))
+                  + head.bias.float() for head in self.heads]
+        return torch.cat(chunks, dim=1)
 
     def add_classes(self, classes: Sequence[int]) -> nn.Linear:
         for head in self.heads:
@@ -215,6 +221,9 @@ class IncrementalClassifier(nn.Module):
 
     def freeze_all(self) -> None:
         self.requires_grad_(False)
+
+    def trainable_scale(self) -> nn.Parameter:
+        return self.logit_scale
 
     def weight_bias(self) -> tuple[Tensor, Tensor]:
         return (torch.cat([head.weight for head in self.heads], dim=0),
@@ -294,6 +303,16 @@ class ECHOModel(nn.Module):
         for module in (self.evidence, self.quality_gate, self.time, self.fusion):
             module.requires_grad_(False)
             module.eval()
+
+    def enable_incremental_finetuning(self) -> List[nn.Parameter]:
+        """Unfreeze only high-level feature layers for incremental plasticity."""
+        modules = (self.time.blocks[-1], self.fusion)
+        parameters: List[nn.Parameter] = []
+        for module in modules:
+            module.requires_grad_(True)
+            module.train()
+            parameters.extend(module.parameters())
+        return parameters
 
     def begin_increment(self, new_classes: Sequence[int], stage: int) -> nn.Linear:
         self.current_stage = int(stage)

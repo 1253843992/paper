@@ -1,4 +1,4 @@
-"""Train the strict ECHO-CIL protocol described in the technical plan."""
+"""Train the accuracy-oriented ECHO-CIL implementation."""
 from __future__ import annotations
 
 import argparse
@@ -84,10 +84,34 @@ def make_loader(dataset: DictDataset, old_classes: Sequence[int],
     return loader, sampler
 
 
+def supervised_contrastive_loss(features: Tensor, labels: Tensor,
+                                temperature: float) -> Tensor:
+    """Single-view supervised contrastive loss for fine-grained severities."""
+    if features.shape[0] < 2:
+        return features.new_zeros(())
+    normalized = nn.functional.normalize(features.float(), dim=1)
+    similarities = normalized @ normalized.transpose(0, 1) / temperature
+    eye = torch.eye(features.shape[0], dtype=torch.bool, device=features.device)
+    positives = labels[:, None].eq(labels[None, :]) & ~eye
+    valid = positives.any(dim=1)
+    if not valid.any():
+        return features.new_zeros(())
+    similarities = similarities - similarities.max(dim=1, keepdim=True).values.detach()
+    log_denominator = torch.logsumexp(
+        similarities.masked_fill(eye, float('-inf')), dim=1)
+    log_probability = similarities - log_denominator[:, None]
+    per_sample = -(log_probability.masked_fill(~positives, 0.0).sum(dim=1)
+                   / positives.sum(dim=1).clamp_min(1))
+    return per_sample[valid].mean()
+
+
 def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
-               diagnostics: dict, old_classes: Sequence[int],
+               features: Tensor, diagnostics: dict, old_classes: Sequence[int],
                new_classes: Sequence[int], competition_margin: float,
                lambda_competition: float, lambda_amplitude: float,
+               teacher_logits: Optional[Tensor] = None,
+               lambda_kd: float = 0.0, kd_temperature: float = 2.0,
+               lambda_supcon: float = 0.0, supcon_temperature: float = 0.07,
                base_stage: bool = False):
     targets = model.classifier.target_indices(batch['y'])
     losses = nn.functional.cross_entropy(logits, targets, reduction='none')
@@ -103,8 +127,14 @@ def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
         sample_weights = torch.where(
             old_mask, losses.new_tensor(old_weight), losses.new_tensor(new_weight))
     ce = (losses * sample_weights).mean()
+    supcon = supervised_contrastive_loss(
+        features, batch['y'], supcon_temperature)
     if base_stage:
-        return ce, {'ce': float(ce.detach()), 'competition': 0.0, 'amplitude': 0.0}
+        total = ce + lambda_supcon * supcon
+        return total, {
+            'ce': float(ce.detach()), 'competition': 0.0, 'amplitude': 0.0,
+            'kd': 0.0, 'supcon': float(supcon.detach()),
+        }
 
     class_positions = {label: index for index, label in enumerate(model.class_ids)}
     competition = []
@@ -119,11 +149,31 @@ def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
             + row[opposite_indices].max() - row[true_index]))
     competition_loss = torch.stack(competition).mean()
     amplitude = diagnostics['current_delta'].pow(2).sum(dim=1).mean()
-    total = ce + lambda_competition * competition_loss + lambda_amplitude * amplitude
+    kd = logits.new_zeros(())
+    if teacher_logits is not None and old_classes:
+        old_mask = torch.zeros_like(batch['y'], dtype=torch.bool)
+        for label in old_classes:
+            old_mask |= batch['y'] == label
+        if old_mask.any():
+            positions = {label: index for index, label in enumerate(model.class_ids)}
+            old_positions = torch.as_tensor(
+                [positions[label] for label in old_classes],
+                device=logits.device, dtype=torch.long)
+            student_old = logits[old_mask].index_select(1, old_positions)
+            teacher_old = teacher_logits[old_mask]
+            kd = nn.functional.kl_div(
+                nn.functional.log_softmax(student_old / kd_temperature, dim=1),
+                nn.functional.softmax(teacher_old / kd_temperature, dim=1),
+                reduction='batchmean') * (kd_temperature ** 2)
+    total = (ce + lambda_competition * competition_loss
+             + lambda_amplitude * amplitude + lambda_kd * kd
+             + lambda_supcon * supcon)
     return total, {
         'ce': float(ce.detach()),
         'competition': float(competition_loss.detach()),
         'amplitude': float(amplitude.detach()),
+        'kd': float(kd.detach()),
+        'supcon': float(supcon.detach()),
     }
 
 
@@ -134,30 +184,61 @@ def train_epochs(model: ECHOModel, loader: DataLoader,
                  new_classes: Sequence[int], competition_margin: float,
                  lambda_competition: float, lambda_amplitude: float,
                  enabled_current: Optional[Iterable[int]] = None,
-                 base_stage: bool = False) -> tuple[int, List[dict]]:
-    parameters = [parameter for parameter in parameters if parameter.requires_grad]
+                 base_stage: bool = False, teacher: Optional[ECHOModel] = None,
+                 lambda_kd: float = 0.0, kd_temperature: float = 2.0,
+                 lambda_supcon: float = 0.0, supcon_temperature: float = 0.07,
+                 validation: Optional[tuple] = None,
+                 early_stopping_patience: int = 0) -> tuple[int, List[dict]]:
+    parameter_spec = list(parameters)
+    if parameter_spec and isinstance(parameter_spec[0], dict):
+        optimizer_groups, clip_parameters = [], []
+        for raw_group in parameter_spec:
+            group = dict(raw_group)
+            group_parameters = [parameter for parameter in group.pop('params')
+                                if parameter.requires_grad]
+            if group_parameters:
+                optimizer_groups.append({'params': group_parameters, **group})
+                clip_parameters.extend(group_parameters)
+        parameters = clip_parameters
+        optimizer_input = optimizer_groups
+    else:
+        parameters = [parameter for parameter in parameter_spec
+                      if parameter.requires_grad]
+        optimizer_input = parameters
     if epochs <= 0 or not parameters:
         return 0, []
-    optimizer = torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        optimizer_input, lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(1, epochs), eta_min=lr * 0.01)
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
     history, steps = [], 0
+    best_state, best_score, stale_epochs = None, -float('inf'), 0
     for epoch in range(epochs):
         sampler.set_epoch(epoch)
         model.train()
-        running = {'loss': 0.0, 'ce': 0.0, 'competition': 0.0, 'amplitude': 0.0}
+        running = {'loss': 0.0, 'ce': 0.0, 'competition': 0.0,
+                   'amplitude': 0.0, 'kd': 0.0, 'supcon': 0.0}
         batches = 0
         for raw in loader:
             batch = to_device(raw, device)
             optimizer.zero_grad(set_to_none=True)
             with amp_context(device, use_amp):
-                logits, _, diagnostics = model(
+                teacher_logits = None
+                if teacher is not None:
+                    with torch.no_grad():
+                        teacher_logits, _, _ = teacher(
+                            batch['x'], batch['order'], batch['quality'], batch['rpm'])
+                logits, features, diagnostics = model(
                     batch['x'], batch['order'], batch['quality'], batch['rpm'],
                     enabled_current=enabled_current)
                 loss, parts = loss_terms(
-                    model, logits, batch, diagnostics, old_classes, new_classes,
+                    model, logits, batch, features, diagnostics,
+                    old_classes, new_classes,
                     competition_margin, lambda_competition, lambda_amplitude,
+                    teacher_logits=teacher_logits, lambda_kd=lambda_kd,
+                    kd_temperature=kd_temperature, lambda_supcon=lambda_supcon,
+                    supcon_temperature=supcon_temperature,
                     base_stage=base_stage)
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -173,11 +254,35 @@ def train_epochs(model: ECHOModel, loader: DataLoader,
                 running[key] += value
             batches += 1; steps += 1
         scheduler.step()
-        history.append({
+        record = {
             'epoch': epoch + 1,
             **{key: value / max(1, batches) for key, value in running.items()},
             'lr': optimizer.param_groups[0]['lr'],
-        })
+            'group_lrs': [group['lr'] for group in optimizer.param_groups],
+        }
+        if validation is not None:
+            val_dataset, active_classes, task_groups, val_batch, val_workers = validation
+            metrics = evaluate(model, val_dataset, active_classes, task_groups,
+                               device, val_batch, val_workers)
+            score = 0.5 * (metrics['macro'] + metrics['old_new_harmonic'])
+            record.update({'validation_macro': metrics['macro'],
+                           'validation_harmonic': metrics['old_new_harmonic'],
+                           'validation_score': score})
+            if score > best_score + 1e-8:
+                best_score, stale_epochs = score, 0
+                best_state = {key: value.detach().cpu().clone()
+                              for key, value in model.state_dict().items()}
+                record['best'] = True
+            else:
+                stale_epochs += 1
+                record['best'] = False
+        history.append(record)
+        if (validation is not None and early_stopping_patience > 0
+                and stale_epochs >= early_stopping_patience):
+            record['stopped_early'] = True
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
     return steps, history
 
 
@@ -286,8 +391,6 @@ def conflict_groups(model: ECHOModel, dataset, old_classes: Sequence[int],
     ranked_new = sorted(
         new_classes,
         key=lambda new: (-max(scores[(old, new)] for old in old_classes), new))
-    if max(scores.values(), default=0.0) <= 0.0:
-        return [list(new_classes)], scores
     groups = []
     for new in ranked_new[:maximum]:
         old_ranked = sorted(old_classes,
@@ -296,7 +399,7 @@ def conflict_groups(model: ECHOModel, dataset, old_classes: Sequence[int],
         group = [new] + conflicts
         if group not in groups:
             groups.append(group)
-    return groups or [list(new_classes)], scores
+    return groups or [[new] for new in new_classes[:maximum]], scores
 
 
 @torch.no_grad()
@@ -426,7 +529,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(parents=[bootstrap])
     parser.add_argument('--data', type=Path, default=Path('echo_cil_processed'))
-    parser.add_argument('--output', type=Path, default=Path('runs/echo_cil_strict'))
+    parser.add_argument('--output', type=Path, default=Path('runs/echo_cil'))
     parser.add_argument('--order', choices=sorted(ORDERS),
                         default=config_values.get('order', 'O0'))
     parser.add_argument('--seed', type=int, default=config_values.get('seed', 0))
@@ -435,12 +538,14 @@ def main() -> None:
     parser.add_argument('--base-epochs', type=int,
                         default=config_values.get('base_epochs', 60))
     parser.add_argument('--head-warmup-epochs', type=int,
-                        default=config_values.get('head_warmup_epochs', 4))
+                        default=config_values.get('head_warmup_epochs', 5))
     parser.add_argument('--expert-warmup-epochs', type=int,
-                        default=config_values.get('expert_group_warmup_epochs', 2))
+                        default=config_values.get('expert_group_warmup_epochs', 3))
     parser.add_argument('--incremental-epochs', type=int,
-                        default=config_values.get('incremental_epochs', 30))
-    parser.add_argument('--lr', type=float, default=config_values.get('lr', 1e-3))
+                        default=config_values.get('incremental_epochs', 60))
+    parser.add_argument('--lr', type=float, default=config_values.get('lr', 5e-4))
+    parser.add_argument('--backbone-lr', type=float,
+                        default=config_values.get('backbone_lr', 1e-5))
     parser.add_argument('--weight-decay', type=float,
                         default=config_values.get('weight_decay', 1e-4))
     parser.add_argument('--competition-margin', type=float,
@@ -449,12 +554,22 @@ def main() -> None:
                         default=config_values.get('lambda_competition', 0.1))
     parser.add_argument('--lambda-amplitude', type=float,
                         default=config_values.get('lambda_amplitude', 1e-4))
+    parser.add_argument('--lambda-kd', type=float,
+                        default=config_values.get('lambda_kd', 1.0))
+    parser.add_argument('--kd-temperature', type=float,
+                        default=config_values.get('kd_temperature', 2.0))
+    parser.add_argument('--lambda-supcon', type=float,
+                        default=config_values.get('lambda_supcon', 0.1))
+    parser.add_argument('--supcon-temperature', type=float,
+                        default=config_values.get('supcon_temperature', 0.07))
+    parser.add_argument('--early-stopping-patience', type=int,
+                        default=config_values.get('early_stopping_patience', 10))
     parser.add_argument('--memory-bytes', type=int,
-                        default=config_values.get('memory_budget_bytes', 512 * 1024))
+                        default=config_values.get('memory_budget_bytes', 32 * 1024 * 1024))
     parser.add_argument('--experts-per-stage', type=int,
-                        default=config_values.get('experts_per_stage_max', 2))
+                        default=config_values.get('experts_per_stage_max', 3))
     parser.add_argument('--expert-limit', type=int,
-                        default=config_values.get('experts_total_max', 4))
+                        default=config_values.get('experts_total_max', 6))
     parser.add_argument('--device', default='auto')
     parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--num-workers', type=int, default=0)
@@ -478,6 +593,10 @@ def main() -> None:
         raise ValueError('--batch-size must be even')
     if args.num_workers < 0:
         raise ValueError('--num-workers must be non-negative')
+    if args.backbone_lr <= 0 or args.lr <= 0:
+        raise ValueError('learning rates must be positive')
+    if args.kd_temperature <= 0 or args.supcon_temperature <= 0:
+        raise ValueError('loss temperatures must be positive')
 
     device = resolve_device(args.device)
     use_amp = bool(args.amp and device.type == 'cuda')
@@ -504,7 +623,9 @@ def main() -> None:
         json.dumps(configuration, ensure_ascii=False, indent=2, default=str),
         encoding='utf-8')
 
-    model = ECHOModel(order[0], expert_limit=args.expert_limit).to(device)
+    model = ECHOModel(
+        order[0], expert_rank=int(config_values.get('expert_rank', 8)),
+        expert_limit=args.expert_limit).to(device)
     memory = ReplayBuffer(args.memory_bytes, args.seed)
     stage_results = []
 
@@ -534,7 +655,11 @@ def main() -> None:
                 args.base_epochs, device, use_amp, args.lr, args.weight_decay,
                 [], new_classes, args.competition_margin,
                 args.lambda_competition, args.lambda_amplitude,
-                base_stage=True)
+                base_stage=True, lambda_supcon=args.lambda_supcon,
+                supcon_temperature=args.supcon_temperature,
+                validation=(val_dataset, active_classes, order[:stage + 1],
+                            args.batch_size, args.num_workers),
+                early_stopping_patience=args.early_stopping_patience)
             stage_log['joint'] = history
             total_steps = steps
         else:
@@ -549,7 +674,10 @@ def main() -> None:
                 args.head_warmup_epochs, device, use_amp, args.lr,
                 args.weight_decay, old_classes, new_classes,
                 args.competition_margin, args.lambda_competition,
-                args.lambda_amplitude)
+                args.lambda_amplitude, teacher=previous_model,
+                lambda_kd=args.lambda_kd, kd_temperature=args.kd_temperature,
+                lambda_supcon=args.lambda_supcon,
+                supcon_temperature=args.supcon_temperature)
             stage_log['head_warmup'] = history
 
             replay_logits, replay_labels = teacher_replay_views(
@@ -597,7 +725,11 @@ def main() -> None:
                     args.expert_warmup_epochs, device, use_amp, args.lr,
                     args.weight_decay, old_classes, new_classes,
                     args.competition_margin, args.lambda_competition,
-                    args.lambda_amplitude, enabled_current=[expert_index])
+                    args.lambda_amplitude, enabled_current=[expert_index],
+                    teacher=previous_model, lambda_kd=args.lambda_kd,
+                    kd_temperature=args.kd_temperature,
+                    lambda_supcon=args.lambda_supcon,
+                    supcon_temperature=args.supcon_temperature)
                 warmup_steps += steps
                 stage_log['expert_warmup'].append({
                     'expert_index': expert_index, 'group': group,
@@ -605,16 +737,28 @@ def main() -> None:
                 })
 
             new_head.requires_grad_(True)
-            joint_parameters = list(new_head.parameters())
+            backbone_parameters = model.enable_incremental_finetuning()
+            adaptive_parameters = list(new_head.parameters())
+            adaptive_parameters.append(model.classifier.trainable_scale())
             for expert_index in expert_indices:
                 model.experts[expert_index].requires_grad_(True)
-                joint_parameters.extend(model.experts[expert_index].parameters())
+                adaptive_parameters.extend(model.experts[expert_index].parameters())
+            joint_parameters = [
+                {'params': adaptive_parameters, 'lr': args.lr},
+                {'params': backbone_parameters, 'lr': args.backbone_lr},
+            ]
             joint_steps, history = train_epochs(
                 model, train_loader, train_sampler, joint_parameters,
                 args.incremental_epochs, device, use_amp, args.lr,
                 args.weight_decay, old_classes, new_classes,
                 args.competition_margin, args.lambda_competition,
-                args.lambda_amplitude)
+                args.lambda_amplitude, teacher=previous_model,
+                lambda_kd=args.lambda_kd, kd_temperature=args.kd_temperature,
+                lambda_supcon=args.lambda_supcon,
+                supcon_temperature=args.supcon_temperature,
+                validation=(val_dataset, active_classes, order[:stage + 1],
+                            args.batch_size, args.num_workers),
+                early_stopping_patience=args.early_stopping_patience)
             stage_log['joint'] = history
             total_steps = head_steps + warmup_steps + joint_steps
 
@@ -692,7 +836,7 @@ def main() -> None:
         }, ensure_ascii=False))
 
     output = {
-        'protocol': 'ECHO-CIL-strict', 'order_name': args.order,
+        'protocol': 'ECHO-CIL-optimized', 'order_name': args.order,
         'order': order, 'seed': args.seed, 'configuration': configuration,
         'stages': stage_results, 'summary': experiment_summary(stage_results),
     }
