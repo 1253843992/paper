@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -69,7 +70,7 @@ def loader_options(device: torch.device, workers: int,
 
 def to_device(raw: Dict[str, np.ndarray], device: torch.device) -> Dict[str, Tensor]:
     result = {}
-    for key in ('x', 'order', 'quality', 'y', 'rpm'):
+    for key in ('x', 'order', 'quality', 'y', 'rpm', 'record_id'):
         tensor = torch.from_numpy(raw[key])
         result[key] = tensor.to(device, non_blocking=device.type == 'cuda')
     return result
@@ -106,11 +107,16 @@ def supervised_contrastive_loss(features: Tensor, labels: Tensor,
     return per_sample[valid].mean()
 
 
-def hard_metric_loss(features: Tensor, labels: Tensor, margin: float = 0.2) -> Tensor:
+def hard_metric_loss(features: Tensor, labels: Tensor, margin: float = 0.2,
+                     record_ids: Optional[Tensor] = None) -> Tensor:
     normalized = nn.functional.normalize(features.float(), dim=1)
     distance = (1.0 - normalized @ normalized.t()).clamp_min(0.0)
     same = labels[:, None].eq(labels[None, :])
     positive = same & ~torch.eye(len(labels), dtype=torch.bool, device=labels.device)
+    if record_ids is not None:
+        cross_record = positive & record_ids[:, None].ne(record_ids[None, :])
+        positive = torch.where(cross_record.any(dim=1, keepdim=True),
+                               cross_record, positive)
     negative = ~same
     valid = positive.any(dim=1) & negative.any(dim=1)
     if not valid.any():
@@ -143,12 +149,16 @@ def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
         sample_weights = torch.where(
             old_mask, losses.new_tensor(old_weight), losses.new_tensor(new_weight))
     ce = (losses * sample_weights).mean()
+    evidence_ce = (nn.functional.cross_entropy(
+        diagnostics['evidence_logits'], targets, reduction='none') * sample_weights).mean()
+    auxiliary = model.lambda_evidence * evidence_ce
     supcon = supervised_contrastive_loss(
         features, batch['y'], supcon_temperature)
-    metric = hard_metric_loss(features, batch['y'])
+    metric = hard_metric_loss(features, batch['y'], record_ids=batch.get('record_id'))
     if base_stage:
-        total = ce + lambda_supcon * supcon + lambda_metric * metric
+        total = ce + auxiliary + lambda_supcon * supcon + lambda_metric * metric
         return total, {
+            'evidence_ce': float(evidence_ce.detach()),
             'ce': float(ce.detach()), 'competition': 0.0, 'amplitude': 0.0,
             'kd': 0.0, 'supcon': float(supcon.detach()), 'metric': float(metric.detach()),
         }
@@ -182,10 +192,11 @@ def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
                 nn.functional.log_softmax(student_old / kd_temperature, dim=1),
                 nn.functional.softmax(teacher_old / kd_temperature, dim=1),
                 reduction='batchmean') * (kd_temperature ** 2)
-    total = (ce + lambda_competition * competition_loss
+    total = (ce + auxiliary + lambda_competition * competition_loss
              + lambda_amplitude * amplitude + lambda_kd * kd
              + lambda_supcon * supcon + lambda_metric * metric)
     return total, {
+        'evidence_ce': float(evidence_ce.detach()),
         'ce': float(ce.detach()),
         'competition': float(competition_loss.detach()),
         'amplitude': float(amplitude.detach()),
@@ -233,11 +244,13 @@ def train_epochs(model: ECHOModel, loader: DataLoader,
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
     history, steps = [], 0
     best_state, best_score, stale_epochs = None, -float('inf'), 0
+    best_validation_ce = float('inf')
     for epoch in range(epochs):
         sampler.set_epoch(epoch)
         model.train()
         running = {'loss': 0.0, 'ce': 0.0, 'competition': 0.0,
-                   'amplitude': 0.0, 'kd': 0.0, 'supcon': 0.0, 'metric': 0.0}
+                   'amplitude': 0.0, 'kd': 0.0, 'supcon': 0.0, 'metric': 0.0,
+                   'evidence_ce': 0.0}
         batches = 0
         for raw in loader:
             batch = to_device(raw, device)
@@ -253,8 +266,9 @@ def train_epochs(model: ECHOModel, loader: DataLoader,
                 teacher_logits = None
                 if teacher is not None:
                     with torch.no_grad():
-                        teacher_logits, _, _ = teacher(
+                        _, teacher_features, _ = teacher(
                             batch['x'], batch['order'], batch['quality'], batch['rpm'])
+                        teacher_logits = teacher.classifier(teacher_features)
                 logits, features, diagnostics = model(
                     batch['x'], batch['order'], batch['quality'], batch['rpm'],
                     enabled_current=enabled_current)
@@ -290,12 +304,18 @@ def train_epochs(model: ECHOModel, loader: DataLoader,
             val_dataset, active_classes, task_groups, val_batch, val_workers = validation
             metrics = evaluate(model, val_dataset, active_classes, task_groups,
                                device, val_batch, val_workers)
-            score = 0.5 * (metrics['macro'] + metrics['old_new_harmonic'])
+            score = (0.4 * metrics['macro'] + 0.4 * metrics['old_new_harmonic']
+                     + 0.2 * metrics['worst_record_time_accuracy'])
             record.update({'validation_macro': metrics['macro'],
                            'validation_harmonic': metrics['old_new_harmonic'],
-                           'validation_score': score})
-            if score > best_score + 1e-8:
+                           'validation_score': score,
+                           'validation_cross_entropy': metrics['cross_entropy']})
+            better_accuracy = score > best_score + 1e-8
+            better_confidence = (abs(score - best_score) <= 1e-8
+                                 and metrics['cross_entropy'] < best_validation_ce - 1e-5)
+            if better_accuracy or better_confidence:
                 best_score, stale_epochs = score, 0
+                best_validation_ce = metrics['cross_entropy']
                 best_state = {key: value.detach().cpu().clone()
                               for key, value in model.state_dict().items()}
                 record['best'] = True
@@ -395,8 +415,9 @@ def tune_prototype_settings(model: ECHOModel, val_dataset,
                         metrics = evaluate(
                             model, val_dataset, active_classes, task_groups,
                             device, batch_size, workers)
-                        score = 0.5 * (
-                            metrics['macro'] + metrics['old_new_harmonic'])
+                        score = (0.4 * metrics['macro']
+                                 + 0.4 * metrics['old_new_harmonic']
+                                 + 0.2 * metrics['worst_record_time_accuracy'])
                         trial = {
                             'weight': float(weight),
                             'neighbors': int(neighbor_count),
@@ -404,9 +425,12 @@ def tune_prototype_settings(model: ECHOModel, val_dataset,
                             'family_weight': float(family_weight),
                             'severity_weight': float(severity_weight),
                             'score': score, 'macro': metrics['macro'],
+                            'cross_entropy': metrics['cross_entropy'],
                             'old_new_harmonic': metrics['old_new_harmonic']}
                         trials.append(trial)
-                        if score > best_score:
+                        if (score > best_score + 1e-8 or
+                                (best is not None and abs(score - best_score) <= 1e-8
+                                 and metrics['cross_entropy'] < best['cross_entropy'] - 1e-5)):
                             best_score, best = score, trial
     model.set_prototype_weight(best['weight'])
     model.set_prototype_options(
@@ -475,11 +499,11 @@ def teacher_replay_views(teacher: ECHOModel, old_items: Sequence[dict],
 
 @torch.no_grad()
 def predict_global(model: ECHOModel, dataset, device: torch.device,
-                   batch_size: int, workers: int):
+                   batch_size: int, workers: int, return_logits: bool = False):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         collate_fn=collate_numpy,
                         **loader_options(device, workers))
-    model.eval(); predictions, labels = [], []
+    model.eval(); predictions, labels, outputs = [], [], []
     class_ids = torch.as_tensor(model.class_ids)
     for raw in loader:
         batch = to_device(raw, device)
@@ -487,7 +511,38 @@ def predict_global(model: ECHOModel, dataset, device: torch.device,
             batch['x'], batch['order'], batch['quality'], batch['rpm'])
         predictions.append(class_ids[logits.argmax(dim=1).cpu()])
         labels.append(batch['y'].cpu())
+        if return_logits:
+            outputs.append(logits.float().cpu())
+    if return_logits:
+        return torch.cat(predictions), torch.cat(labels), torch.cat(outputs)
     return torch.cat(predictions), torch.cat(labels)
+
+
+@torch.no_grad()
+def export_predictions(path: Path, model: ECHOModel, dataset,
+                       device: torch.device, batch_size: int) -> None:
+    predictions, labels, logits = predict_global(
+        model, dataset, device, batch_size, 0, return_logits=True)
+    probabilities = logits.softmax(dim=1)
+    scores, positions = probabilities.topk(min(2, model.num_classes), dim=1)
+    fields = ['sample_id', 'record_id', 'source', 'load', 'rpm', 'start',
+              'true_class', 'prediction', 'correct', 'second_class',
+              'top_probability', 'second_probability', 'probability_margin']
+    with path.open('w', newline='', encoding='utf-8-sig') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for index, row in enumerate(dataset.rows):
+            first = float(scores[index, 0])
+            second = float(scores[index, -1])
+            writer.writerow({
+                **{key: row.get(key, '') for key in fields[:6]},
+                'true_class': int(labels[index]),
+                'prediction': int(predictions[index]),
+                'correct': int(predictions[index]) == int(labels[index]),
+                'second_class': model.class_ids[int(positions[index, -1])],
+                'top_probability': first, 'second_probability': second,
+                'probability_margin': first - second,
+            })
 
 
 def conflict_groups(model: ECHOModel, dataset, old_classes: Sequence[int],
@@ -520,8 +575,24 @@ def conflict_groups(model: ECHOModel, dataset, old_classes: Sequence[int],
 def evaluate(model: ECHOModel, dataset, active_classes: Sequence[int],
              task_groups: Sequence[Sequence[int]], device: torch.device,
              batch_size: int, workers: int) -> dict:
-    predictions, labels = predict_global(
-        model, dataset, device, batch_size, workers)
+    predictions, labels, logits = predict_global(
+        model, dataset, device, batch_size, workers, return_logits=True)
+    target_indices = model.classifier.target_indices(labels)
+    cross_entropy = float(nn.functional.cross_entropy(logits, target_indices))
+    record_time_accuracy = {}
+    if hasattr(dataset, 'rows'):
+        record_indices = {}
+        for index, row in enumerate(dataset.rows):
+            record_indices.setdefault(row['record_id'], []).append(index)
+        for record, indices in record_indices.items():
+            indices.sort(key=lambda index: int(dataset.rows[index]['start']))
+            for block, chunk in enumerate(np.array_split(indices, 2)):
+                if len(chunk):
+                    selection = torch.as_tensor(chunk, dtype=torch.long)
+                    record_time_accuracy[f'{record}:{block}'] = float(
+                        (predictions[selection] == labels[selection]).float().mean())
+    worst_record_time_accuracy = min(
+        record_time_accuracy.values(), default=1.0)
     per_class = {}
     confusion = np.zeros((len(active_classes), len(active_classes)), dtype=np.int64)
     position = {label: index for index, label in enumerate(active_classes)}
@@ -539,6 +610,9 @@ def evaluate(model: ECHOModel, dataset, active_classes: Sequence[int],
     return {
         'overall': float((predictions == labels).float().mean()),
         'macro': macro(active_classes), 'old': old_acc, 'new': new_acc,
+        'cross_entropy': cross_entropy,
+        'record_time_accuracy': record_time_accuracy,
+        'worst_record_time_accuracy': worst_record_time_accuracy,
         'old_new_harmonic': harmonic, 'per_class': per_class,
         'task_macro': [macro(group) for group in task_groups],
         'confusion': confusion.tolist(),
@@ -704,11 +778,23 @@ def main() -> None:
                         default=config_values.get('experts_per_stage_max', 3))
     parser.add_argument('--expert-limit', type=int,
                         default=config_values.get('experts_total_max', 6))
+    parser.add_argument('--lambda-evidence', type=float,
+                        default=config_values.get('lambda_evidence', 0.3))
+    parser.add_argument('--spectral-dropout', type=float,
+                        default=config_values.get('spectral_dropout', 0.2))
+    parser.add_argument('--evidence-weights', type=float, nargs='+',
+                        default=config_values.get('evidence_weights', [0.0, 0.1, 0.25, 0.5]))
     parser.add_argument('--device', default='auto')
     parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--deterministic', action='store_true')
     args = parser.parse_args()
+    if not 0.0 <= args.spectral_dropout < 1.0:
+        parser.error('--spectral-dropout must be in [0, 1)')
+    if not math.isfinite(args.lambda_evidence) or args.lambda_evidence < 0:
+        parser.error('--lambda-evidence must be finite and non-negative')
+    if any(not 0.0 <= weight < 1.0 for weight in args.evidence_weights):
+        parser.error('--evidence-weights must be in [0, 1)')
 
     if not args.data.exists():
         candidate = Path(__file__).resolve().parent / args.data
@@ -769,6 +855,8 @@ def main() -> None:
     model = ECHOModel(
         order[0], expert_rank=int(config_values.get('expert_rank', 8)),
         expert_limit=args.expert_limit).to(device)
+    model.lambda_evidence = args.lambda_evidence
+    model.spectral_dropout = args.spectral_dropout
     memory = ReplayBuffer(args.memory_bytes, args.seed)
     stage_results = []
 
@@ -960,12 +1048,30 @@ def main() -> None:
             args.prototype_neighbors, args.prototype_rpm_penalties,
             args.prototype_family_weights, args.prototype_severity_weights)
 
+        # Select the independent physical path on validation only. Always
+        # include zero so the original prediction path remains a candidate.
+        evidence_trials = []
+        for weight in sorted(set([0.0] + args.evidence_weights)):
+            model.evidence_weight.fill_(weight)
+            metrics = evaluate(model, val_dataset, active_classes,
+                               order[:stage + 1], device, args.batch_size, 0)
+            score = (0.4 * metrics['macro'] + 0.4 * metrics['old_new_harmonic']
+                     + 0.2 * metrics['worst_record_time_accuracy'])
+            evidence_trials.append({'weight': weight, 'score': score,
+                                    'macro': metrics['macro'],
+                                    'cross_entropy': metrics['cross_entropy']})
+        evidence_best = max(evidence_trials, key=lambda trial: (
+            trial['score'], -trial['cross_entropy'], -trial['weight']))
+        model.evidence_weight.fill_(evidence_best['weight'])
+
         val_result = evaluate(
             model, val_dataset, active_classes, order[:stage + 1], device,
             args.batch_size, args.num_workers)
         test_result = evaluate(
             model, test_dataset, active_classes, order[:stage + 1], device,
             args.batch_size, args.num_workers)
+        export_predictions(args.output / f'predictions_stage_{stage}.csv',
+                           model, test_dataset, device, args.batch_size)
         mechanisms = mechanism_metrics(
             model, test_dataset, device, args.batch_size, args.num_workers)
         capture = 0.0
@@ -996,6 +1102,8 @@ def main() -> None:
             'prototype_family_weight': prototype_settings['family_weight'],
             'prototype_severity_weight': prototype_settings['severity_weight'],
             'prototype_trials': prototype_trials,
+            'evidence_weight': evidence_best['weight'],
+            'evidence_trials': evidence_trials,
             'experts_total': len(model.experts),
             'memory_count': len(memory.all()),
             'memory_counts': memory.counts(),

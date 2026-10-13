@@ -97,8 +97,11 @@ class GroupBalancedBatchSampler(Sampler[List[int]]):
         self.epoch = 0
         self.steps = steps or max(1, int(np.ceil(len(dataset) / batch_size)))
         self.by_class: Dict[int, List[int]] = defaultdict(list)
+        self.by_record: Dict[int, Dict[int, List[int]]] = defaultdict(
+            lambda: defaultdict(list))
         for index, item in enumerate(dataset.items):
             self.by_class[int(item['y'])].append(index)
+            self.by_record[int(item['y'])][int(item['record_id'])].append(index)
         missing = [c for c in self.old_classes + self.new_classes
                    if not self.by_class[c]]
         if missing:
@@ -112,8 +115,18 @@ class GroupBalancedBatchSampler(Sampler[List[int]]):
 
     def _draw_group(self, rng: np.random.Generator,
                     classes: Sequence[int], count: int) -> List[int]:
-        labels = rng.choice(np.asarray(classes), size=count, replace=True)
-        return [int(rng.choice(self.by_class[int(label)])) for label in labels]
+        labels = np.resize(rng.permutation(np.asarray(classes)), count)
+        rng.shuffle(labels)
+        indices = []
+        record_cycles = {}
+        for label in labels:
+            label = int(label)
+            records = self.by_record[label]
+            if not record_cycles.get(label):
+                record_cycles[label] = list(rng.permutation(list(records)))
+            record = int(record_cycles[label].pop())
+            indices.append(int(rng.choice(records[record])))
+        return indices
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + 104729 * self.epoch)

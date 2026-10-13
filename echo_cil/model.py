@@ -241,13 +241,14 @@ class SpectrumEncoder(nn.Module):
     def __init__(self, dim: int = 128):
         super().__init__()
         self.encoder = nn.Sequential(
-            ConvGNAct(1, 32, 9, stride=2, padding=4),
+            ConvGNAct(2, 32, 9, stride=2, padding=4),
             ConvGNAct(32, 64, 7, stride=2, padding=3),
             ConvGNAct(64, 128, 5, stride=2, padding=2),
             nn.AdaptiveAvgPool1d(16), nn.Flatten(),
             nn.Linear(128 * 16, dim), nn.LayerNorm(dim),
         )
         self.register_buffer('window', torch.hann_window(WINDOW))
+        self.register_buffer('segment_window', torch.hann_window(512))
 
     def forward(self, x: Tensor) -> Tensor:
         # FFT remains float32 even under CUDA AMP.
@@ -255,12 +256,23 @@ class SpectrumEncoder(nn.Module):
             centered = x.float() - x.float().mean(dim=1, keepdim=True)
             power = torch.fft.rfft(centered * self.window, dim=1).abs().square()
             relative = power / power.mean(dim=1, keepdim=True).clamp_min(1e-8)
-            spectrum = torch.log1p(relative).unsqueeze(1)
+            # Seven overlapping windows reduce the variance of isolated
+            # transients; retain the full-window channel for fine resolution.
+            segments = centered.unfold(1, 512, 256)
+            segments = segments - segments.mean(dim=-1, keepdim=True)
+            segment_power = torch.fft.rfft(
+                segments * self.segment_window, dim=-1).abs().square().mean(dim=1)
+            segment_relative = segment_power / segment_power.mean(
+                dim=1, keepdim=True).clamp_min(1e-8)
+            averaged = F.interpolate(
+                torch.log1p(segment_relative).unsqueeze(1),
+                size=power.shape[1], mode='linear', align_corners=True)
+            spectrum = torch.cat((torch.log1p(relative).unsqueeze(1), averaged), dim=1)
         return self.encoder(spectrum)
 
 
 class ECHOModel(nn.Module):
-    """Strict ECHO-CIL network: conditional encoder plus protected experts."""
+    """Conditional encoder with independently supervised physical evidence."""
 
     def __init__(self, base_classes: Sequence[int], feature_dim: int = 128,
                  expert_rank: int = 8, expert_limit: int = 4):
@@ -274,6 +286,15 @@ class ECHOModel(nn.Module):
             nn.Linear(2 * feature_dim, feature_dim), nn.LayerNorm(feature_dim))
         self.experts = nn.ModuleList()
         self.classifier = IncrementalClassifier(feature_dim, base_classes)
+        self.evidence_norm = nn.LayerNorm(feature_dim)
+        self.evidence_classifier = IncrementalClassifier(feature_dim, base_classes)
+        self.spectral_gate = nn.Sequential(
+            nn.Linear(2 * feature_dim + 1, 32), nn.SiLU(), nn.Linear(32, 1))
+        nn.init.zeros_(self.spectral_gate[-1].weight)
+        nn.init.zeros_(self.spectral_gate[-1].bias)
+        self.spectral_dropout = 0.2
+        self.lambda_evidence = 0.3
+        self.register_buffer('evidence_weight', torch.tensor(0.0))
         self.register_buffer('prototype_vectors', torch.empty(0, feature_dim))
         self.register_buffer('prototype_labels', torch.empty(0, dtype=torch.long))
         self.register_buffer('prototype_rpms', torch.empty(0))
@@ -301,10 +322,20 @@ class ECHOModel(nn.Module):
         time_tokens, scale_weights = self.time(x, evidence, gamma)
         h, cross_attention = self.fusion(time_tokens, evidence, gamma)
         spectral = self.spectrum(x)
-        h = h + self.spectral_fusion(torch.cat((h, spectral), dim=1))
+        physical = self.evidence_norm(evidence.mean(dim=1))
+        spectral_gate = torch.sigmoid(self.spectral_gate(
+            torch.cat((h, physical, gamma), dim=1)))
+        # Drop the entire spectral residual, not individual frequency bins.
+        # Do not perturb a frozen backbone during head/expert warm-up.
+        contribution = spectral_gate
+        if self.training and any(p.requires_grad for p in self.spectral_gate.parameters()):
+            keep = (torch.rand_like(contribution) >= self.spectral_dropout)
+            contribution = contribution * keep / (1.0 - self.spectral_dropout)
+        h = h + contribution * self.spectral_fusion(torch.cat((h, spectral), dim=1))
         diagnostics = {
             'gamma': gamma, 'harmonic_attention': harmonic_attention,
             'scale_weights': scale_weights, 'cross_attention': cross_attention,
+            'evidence_features': physical, 'spectral_gate': spectral_gate,
         }
         return h, gamma, diagnostics
 
@@ -335,6 +366,8 @@ class ECHOModel(nn.Module):
         z, diagnostics = self.representation(
             x, order, quality, rpm, enabled_current=enabled_current)
         logits = self.classifier(z)
+        evidence_logits = self.evidence_classifier(diagnostics['evidence_features'])
+        diagnostics['evidence_logits'] = evidence_logits
         if (not self.training and self.prototype_vectors.numel()
                 and float(self.prototype_weight) > 0.0):
             similarities = (F.normalize(z.float(), dim=1)
@@ -381,6 +414,13 @@ class ECHOModel(nn.Module):
                     prototype_logits[:, positions[label_value]] = scale * hierarchical_score
             weight = self.prototype_weight.to(logits)
             logits = (1.0 - weight) * logits + weight * prototype_logits
+        # Probability mixture keeps differently calibrated heads comparable.
+        # This independent path remains separate from the prototype embedding.
+        if not self.training and float(self.evidence_weight) > 0.0:
+            weight = self.evidence_weight.float()
+            logits = torch.logaddexp(
+                F.log_softmax(logits.float(), dim=1) + torch.log1p(-weight),
+                F.log_softmax(evidence_logits.float(), dim=1) + weight.log())
         return logits, z, diagnostics
 
     def set_prototypes(self, vectors: Tensor, labels: Tensor, rpms: Tensor,
@@ -418,14 +458,16 @@ class ECHOModel(nn.Module):
 
     def freeze_base(self) -> None:
         for module in (self.evidence, self.quality_gate, self.time, self.fusion,
-                       self.spectrum, self.spectral_fusion):
+                       self.spectrum, self.spectral_fusion, self.spectral_gate,
+                       self.evidence_norm, self.evidence_classifier):
             module.requires_grad_(False)
             module.eval()
 
     def enable_incremental_finetuning(self) -> List[nn.Parameter]:
         """Unfreeze only high-level feature layers for incremental plasticity."""
         modules = (self.time.blocks[-1], self.fusion, self.spectrum,
-                   self.spectral_fusion)
+                   self.spectral_fusion, self.spectral_gate, self.evidence,
+                   self.evidence_norm, self.evidence_classifier)
         parameters: List[nn.Parameter] = []
         for module in modules:
             module.requires_grad_(True)
@@ -436,7 +478,10 @@ class ECHOModel(nn.Module):
     def begin_increment(self, new_classes: Sequence[int], stage: int) -> nn.Linear:
         self.current_stage = int(stage)
         self.clear_prototypes()
+        self.evidence_weight.zero_()
         self.freeze_base()
+        self.evidence_classifier.add_classes(new_classes)
+        self.evidence_classifier.requires_grad_(False)
         for expert in self.experts:
             expert.requires_grad_(False)
             expert.eval()
@@ -459,6 +504,10 @@ class ECHOModel(nn.Module):
 
     def architecture_metadata(self) -> Dict[str, object]:
         return {
+            'evidence_supervision': True,
+            'spectral_dropout': self.spectral_dropout,
+            'lambda_evidence': self.lambda_evidence,
+            'evidence_weight': float(self.evidence_weight),
             'class_chunks': self.classifier.class_chunks,
             'expert_stages': [expert.stage for expert in self.experts],
             'expert_groups': [list(expert.group) for expert in self.experts],
