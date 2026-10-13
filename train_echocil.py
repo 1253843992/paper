@@ -106,6 +106,21 @@ def supervised_contrastive_loss(features: Tensor, labels: Tensor,
     return per_sample[valid].mean()
 
 
+def hard_metric_loss(features: Tensor, labels: Tensor, margin: float = 0.2) -> Tensor:
+    normalized = nn.functional.normalize(features.float(), dim=1)
+    distance = (1.0 - normalized @ normalized.t()).clamp_min(0.0)
+    same = labels[:, None].eq(labels[None, :])
+    positive = same & ~torch.eye(len(labels), dtype=torch.bool, device=labels.device)
+    negative = ~same
+    valid = positive.any(dim=1) & negative.any(dim=1)
+    if not valid.any():
+        return features.sum() * 0.0
+    hardest_positive = distance.masked_fill(~positive, float('-inf')).max(dim=1).values
+    hardest_negative = distance.masked_fill(~negative, float('inf')).min(dim=1).values
+    return nn.functional.relu(
+        hardest_positive[valid] - hardest_negative[valid] + margin).mean()
+
+
 def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
                features: Tensor, diagnostics: dict, old_classes: Sequence[int],
                new_classes: Sequence[int], competition_margin: float,
@@ -113,7 +128,7 @@ def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
                teacher_logits: Optional[Tensor] = None,
                lambda_kd: float = 0.0, kd_temperature: float = 2.0,
                lambda_supcon: float = 0.0, supcon_temperature: float = 0.07,
-               base_stage: bool = False):
+               base_stage: bool = False, lambda_metric: float = 0.05):
     targets = model.classifier.target_indices(batch['y'])
     losses = nn.functional.cross_entropy(logits, targets, reduction='none')
     if base_stage:
@@ -130,11 +145,12 @@ def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
     ce = (losses * sample_weights).mean()
     supcon = supervised_contrastive_loss(
         features, batch['y'], supcon_temperature)
+    metric = hard_metric_loss(features, batch['y'])
     if base_stage:
-        total = ce + lambda_supcon * supcon
+        total = ce + lambda_supcon * supcon + lambda_metric * metric
         return total, {
             'ce': float(ce.detach()), 'competition': 0.0, 'amplitude': 0.0,
-            'kd': 0.0, 'supcon': float(supcon.detach()),
+            'kd': 0.0, 'supcon': float(supcon.detach()), 'metric': float(metric.detach()),
         }
 
     class_positions = {label: index for index, label in enumerate(model.class_ids)}
@@ -168,13 +184,14 @@ def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
                 reduction='batchmean') * (kd_temperature ** 2)
     total = (ce + lambda_competition * competition_loss
              + lambda_amplitude * amplitude + lambda_kd * kd
-             + lambda_supcon * supcon)
+             + lambda_supcon * supcon + lambda_metric * metric)
     return total, {
         'ce': float(ce.detach()),
         'competition': float(competition_loss.detach()),
         'amplitude': float(amplitude.detach()),
         'kd': float(kd.detach()),
         'supcon': float(supcon.detach()),
+        'metric': float(metric.detach()),
     }
 
 
@@ -210,8 +227,9 @@ def train_epochs(model: ECHOModel, loader: DataLoader,
         return 0, []
     optimizer = torch.optim.AdamW(
         optimizer_input, lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, epochs), eta_min=lr * 0.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda step: 0.01 + 0.99 * 0.5 * (
+            1.0 + math.cos(math.pi * min(step, epochs) / max(1, epochs))))
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
     history, steps = [], 0
     best_state, best_score, stale_epochs = None, -float('inf'), 0
@@ -219,10 +237,17 @@ def train_epochs(model: ECHOModel, loader: DataLoader,
         sampler.set_epoch(epoch)
         model.train()
         running = {'loss': 0.0, 'ce': 0.0, 'competition': 0.0,
-                   'amplitude': 0.0, 'kd': 0.0, 'supcon': 0.0}
+                   'amplitude': 0.0, 'kd': 0.0, 'supcon': 0.0, 'metric': 0.0}
         batches = 0
         for raw in loader:
             batch = to_device(raw, device)
+            # Circular translation preserves vibration frequency magnitudes.
+            # Keep cached order/quality as an unshifted conditioning view.
+            shifts = torch.randint(0, batch['x'].shape[1],
+                                   (len(batch['x']), 1), device=device)
+            indices = (torch.arange(batch['x'].shape[1], device=device)[None, :]
+                       + shifts) % batch['x'].shape[1]
+            batch['x'] = batch['x'].gather(1, indices)
             optimizer.zero_grad(set_to_none=True)
             with amp_context(device, use_amp):
                 teacher_logits = None
@@ -354,26 +379,39 @@ def tune_prototype_settings(model: ECHOModel, val_dataset,
                             device: torch.device, batch_size: int,
                             workers: int, weights: Sequence[float],
                             neighbors: Sequence[int],
-                            rpm_penalties: Sequence[float]) -> tuple[dict, List[dict]]:
+                            rpm_penalties: Sequence[float],
+                            family_weights: Sequence[float],
+                            severity_weights: Sequence[float]) -> tuple[dict, List[dict]]:
     trials, best, best_score = [], None, -float('inf')
     for weight in weights:
         for neighbor_count in neighbors:
             for rpm_penalty in rpm_penalties:
-                model.set_prototype_weight(float(weight))
-                model.set_prototype_options(int(neighbor_count), float(rpm_penalty))
-                metrics = evaluate(model, val_dataset, active_classes, task_groups,
-                                   device, batch_size, workers)
-                score = 0.5 * (metrics['macro'] + metrics['old_new_harmonic'])
-                trial = {'weight': float(weight),
-                         'neighbors': int(neighbor_count),
-                         'rpm_penalty': float(rpm_penalty), 'score': score,
-                         'macro': metrics['macro'],
-                         'old_new_harmonic': metrics['old_new_harmonic']}
-                trials.append(trial)
-                if score > best_score:
-                    best_score, best = score, trial
+                for family_weight in family_weights:
+                    for severity_weight in severity_weights:
+                        model.set_prototype_weight(float(weight))
+                        model.set_prototype_options(
+                            int(neighbor_count), float(rpm_penalty),
+                            float(family_weight), float(severity_weight))
+                        metrics = evaluate(
+                            model, val_dataset, active_classes, task_groups,
+                            device, batch_size, workers)
+                        score = 0.5 * (
+                            metrics['macro'] + metrics['old_new_harmonic'])
+                        trial = {
+                            'weight': float(weight),
+                            'neighbors': int(neighbor_count),
+                            'rpm_penalty': float(rpm_penalty),
+                            'family_weight': float(family_weight),
+                            'severity_weight': float(severity_weight),
+                            'score': score, 'macro': metrics['macro'],
+                            'old_new_harmonic': metrics['old_new_harmonic']}
+                        trials.append(trial)
+                        if score > best_score:
+                            best_score, best = score, trial
     model.set_prototype_weight(best['weight'])
-    model.set_prototype_options(best['neighbors'], best['rpm_penalty'])
+    model.set_prototype_options(
+        best['neighbors'], best['rpm_penalty'], best['family_weight'],
+        best['severity_weight'])
     return best, trials
 
 
@@ -648,10 +686,16 @@ def main() -> None:
                         default=config_values.get(
                             'prototype_weights', [1.0]))
     parser.add_argument('--prototype-neighbors', type=int, nargs='+',
-                        default=config_values.get('prototype_neighbors', [1, 3, 5]))
+                        default=config_values.get('prototype_neighbors', [1]))
     parser.add_argument('--prototype-rpm-penalties', type=float, nargs='+',
                         default=config_values.get(
-                            'prototype_rpm_penalties', [0.0, 2.0, 5.0, 10.0]))
+                            'prototype_rpm_penalties', [5.0, 10.0, 15.0]))
+    parser.add_argument('--prototype-family-weights', type=float, nargs='+',
+                        default=config_values.get(
+                            'prototype_family_weights', [0.25, 0.5, 0.0]))
+    parser.add_argument('--prototype-severity-weights', type=float, nargs='+',
+                        default=config_values.get(
+                            'prototype_severity_weights', [0.25, 0.5, 0.0]))
     parser.add_argument('--prototypes-per-record', type=int,
                         default=config_values.get('prototypes_per_record', 0))
     parser.add_argument('--memory-bytes', type=int,
@@ -693,6 +737,9 @@ def main() -> None:
         raise ValueError('--prototype-neighbors values must be positive')
     if any(value < 0 for value in args.prototype_rpm_penalties):
         raise ValueError('--prototype-rpm-penalties values must be non-negative')
+    if any(value < 0 for value in (args.prototype_family_weights
+                                   + args.prototype_severity_weights)):
+        raise ValueError('prototype hierarchy weights must be non-negative')
 
     device = resolve_device(args.device)
     use_amp = bool(args.amp and device.type == 'cuda')
@@ -910,7 +957,8 @@ def main() -> None:
         prototype_settings, prototype_trials = tune_prototype_settings(
             model, val_dataset, active_classes, order[:stage + 1], device,
             args.batch_size, 0, args.prototype_weights,
-            args.prototype_neighbors, args.prototype_rpm_penalties)
+            args.prototype_neighbors, args.prototype_rpm_penalties,
+            args.prototype_family_weights, args.prototype_severity_weights)
 
         val_result = evaluate(
             model, val_dataset, active_classes, order[:stage + 1], device,
@@ -945,6 +993,8 @@ def main() -> None:
             'prototype_weight': prototype_settings['weight'],
             'prototype_neighbors': prototype_settings['neighbors'],
             'prototype_rpm_penalty': prototype_settings['rpm_penalty'],
+            'prototype_family_weight': prototype_settings['family_weight'],
+            'prototype_severity_weight': prototype_settings['severity_weight'],
             'prototype_trials': prototype_trials,
             'experts_total': len(model.experts),
             'memory_count': len(memory.all()),

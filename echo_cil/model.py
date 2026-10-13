@@ -235,6 +235,30 @@ class IncrementalClassifier(nn.Module):
         return torch.as_tensor(values, device=labels.device, dtype=torch.long)
 
 
+class SpectrumEncoder(nn.Module):
+    """Retain carrier-band power patterns absent from envelope order features."""
+
+    def __init__(self, dim: int = 128):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            ConvGNAct(1, 32, 9, stride=2, padding=4),
+            ConvGNAct(32, 64, 7, stride=2, padding=3),
+            ConvGNAct(64, 128, 5, stride=2, padding=2),
+            nn.AdaptiveAvgPool1d(16), nn.Flatten(),
+            nn.Linear(128 * 16, dim), nn.LayerNorm(dim),
+        )
+        self.register_buffer('window', torch.hann_window(WINDOW))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # FFT remains float32 even under CUDA AMP.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            centered = x.float() - x.float().mean(dim=1, keepdim=True)
+            power = torch.fft.rfft(centered * self.window, dim=1).abs().square()
+            relative = power / power.mean(dim=1, keepdim=True).clamp_min(1e-8)
+            spectrum = torch.log1p(relative).unsqueeze(1)
+        return self.encoder(spectrum)
+
+
 class ECHOModel(nn.Module):
     """Strict ECHO-CIL network: conditional encoder plus protected experts."""
 
@@ -245,6 +269,9 @@ class ECHOModel(nn.Module):
         self.quality_gate = QualityGate()
         self.time = TimeEncoder()
         self.fusion = CrossDomainFusion(feature_dim)
+        self.spectrum = SpectrumEncoder(feature_dim)
+        self.spectral_fusion = nn.Sequential(
+            nn.Linear(2 * feature_dim, feature_dim), nn.LayerNorm(feature_dim))
         self.experts = nn.ModuleList()
         self.classifier = IncrementalClassifier(feature_dim, base_classes)
         self.register_buffer('prototype_vectors', torch.empty(0, feature_dim))
@@ -253,6 +280,8 @@ class ECHOModel(nn.Module):
         self.register_buffer('prototype_weight', torch.tensor(0.0))
         self.register_buffer('prototype_neighbors', torch.tensor(1, dtype=torch.long))
         self.register_buffer('prototype_rpm_penalty', torch.tensor(0.0))
+        self.register_buffer('prototype_family_weight', torch.tensor(0.0))
+        self.register_buffer('prototype_severity_weight', torch.tensor(0.0))
         self.feature_dim = feature_dim
         self.expert_rank = expert_rank
         self.expert_limit = expert_limit
@@ -271,6 +300,8 @@ class ECHOModel(nn.Module):
         evidence, harmonic_attention = self.evidence(order, rpm)
         time_tokens, scale_weights = self.time(x, evidence, gamma)
         h, cross_attention = self.fusion(time_tokens, evidence, gamma)
+        spectral = self.spectrum(x)
+        h = h + self.spectral_fusion(torch.cat((h, spectral), dim=1))
         diagnostics = {
             'gamma': gamma, 'harmonic_attention': harmonic_attention,
             'scale_weights': scale_weights, 'cross_attention': cross_attention,
@@ -323,9 +354,31 @@ class ECHOModel(nn.Module):
                     class_similarities = similarities[:, mask]
                     neighbors = min(
                         int(self.prototype_neighbors), class_similarities.shape[1])
-                    prototype_logits[:, positions[int(label)]] = (
-                        scale * class_similarities.topk(
-                            neighbors, dim=1).values.mean(dim=1))
+                    class_score = class_similarities.topk(
+                        neighbors, dim=1).values.mean(dim=1)
+                    label_value = int(label)
+                    if label_value == 0:
+                        family_mask = self.prototype_labels == 0
+                        severity_mask = family_mask
+                    else:
+                        prototype_family = 1 + (self.prototype_labels - 1) % 3
+                        prototype_severity = 1 + (self.prototype_labels - 1) // 3
+                        fault_mask = self.prototype_labels > 0
+                        family_mask = fault_mask & (
+                            prototype_family == 1 + (label_value - 1) % 3)
+                        severity_mask = fault_mask & (
+                            prototype_severity == 1 + (label_value - 1) // 3)
+                    family_score = similarities[:, family_mask].topk(
+                        min(neighbors, int(family_mask.sum())), dim=1).values.mean(dim=1)
+                    severity_score = similarities[:, severity_mask].topk(
+                        min(neighbors, int(severity_mask.sum())), dim=1).values.mean(dim=1)
+                    family_weight = self.prototype_family_weight.to(logits)
+                    severity_weight = self.prototype_severity_weight.to(logits)
+                    hierarchical_score = (
+                        class_score + family_weight * family_score
+                        + severity_weight * severity_score) / (
+                            1.0 + family_weight + severity_weight)
+                    prototype_logits[:, positions[label_value]] = scale * hierarchical_score
             weight = self.prototype_weight.to(logits)
             logits = (1.0 - weight) * logits + weight * prototype_logits
         return logits, z, diagnostics
@@ -343,10 +396,13 @@ class ECHOModel(nn.Module):
     def set_prototype_weight(self, weight: float) -> None:
         self.prototype_weight.fill_(float(weight))
 
-    def set_prototype_options(self, neighbors: int,
-                              rpm_penalty: float) -> None:
+    def set_prototype_options(self, neighbors: int, rpm_penalty: float,
+                              family_weight: float = 0.0,
+                              severity_weight: float = 0.0) -> None:
         self.prototype_neighbors.fill_(int(neighbors))
         self.prototype_rpm_penalty.fill_(float(rpm_penalty))
+        self.prototype_family_weight.fill_(float(family_weight))
+        self.prototype_severity_weight.fill_(float(severity_weight))
 
     def clear_prototypes(self) -> None:
         device = next(self.parameters()).device
@@ -357,15 +413,19 @@ class ECHOModel(nn.Module):
         self.prototype_weight.zero_()
         self.prototype_neighbors.fill_(1)
         self.prototype_rpm_penalty.zero_()
+        self.prototype_family_weight.zero_()
+        self.prototype_severity_weight.zero_()
 
     def freeze_base(self) -> None:
-        for module in (self.evidence, self.quality_gate, self.time, self.fusion):
+        for module in (self.evidence, self.quality_gate, self.time, self.fusion,
+                       self.spectrum, self.spectral_fusion):
             module.requires_grad_(False)
             module.eval()
 
     def enable_incremental_finetuning(self) -> List[nn.Parameter]:
         """Unfreeze only high-level feature layers for incremental plasticity."""
-        modules = (self.time.blocks[-1], self.fusion)
+        modules = (self.time.blocks[-1], self.fusion, self.spectrum,
+                   self.spectral_fusion)
         parameters: List[nn.Parameter] = []
         for module in modules:
             module.requires_grad_(True)
@@ -409,4 +469,6 @@ class ECHOModel(nn.Module):
             'prototype_weight': float(self.prototype_weight),
             'prototype_neighbors': int(self.prototype_neighbors),
             'prototype_rpm_penalty': float(self.prototype_rpm_penalty),
+            'prototype_family_weight': float(self.prototype_family_weight),
+            'prototype_severity_weight': float(self.prototype_severity_weight),
         }
