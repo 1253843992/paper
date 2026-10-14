@@ -17,6 +17,7 @@
   "experts_per_stage_max": 3,
   "experts_total_max": 6,
   "memory_budget_bytes": 33554432,
+  "replay_fraction": 0.1,
   "competition_margin": 0.5,
   "lambda_competition": 0.1,
   "lambda_amplitude": 0.0001,

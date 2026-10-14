@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -18,12 +19,17 @@ MEMORY_DTYPE = np.dtype([
 
 
 class ReplayBuffer:
-    """Auditable waveform-only replay under an actual serialized-byte cap."""
+    """Replay capped by both bytes and <=10% of distinct seen training windows."""
 
-    def __init__(self, byte_budget: int = 512 * 1024, seed: int = 0):
+    def __init__(self, byte_budget: int = 512 * 1024, seed: int = 0,
+                 max_fraction: float = 0.1):
         self.byte_budget = int(byte_budget)
         self.seed = int(seed)
         self.items: Dict[int, List[dict]] = defaultdict(list)
+        self.max_fraction = float(max_fraction)
+        self.seen_counts: Dict[int, int] = {}
+        if not 0.0 < self.max_fraction <= 0.1:
+            raise ValueError('max_fraction must be in (0, 0.1]')
         if self.byte_budget <= 0:
             raise ValueError('byte_budget must be positive')
 
@@ -94,6 +100,25 @@ class ReplayBuffer:
     def update(self, new_candidates: Sequence[dict],
                active_classes: Sequence[int]) -> None:
         classes = list(active_classes)
+        # Only newly introduced classes may contribute fresh samples. Old
+        # samples must come exclusively from the previously retained buffer.
+        new_by_class: Dict[int, set] = defaultdict(set)
+        for item in new_candidates:
+            label = int(item['y'])
+            if label in self.seen_counts:
+                raise ValueError('cannot reload old-class training candidates')
+            if label not in classes:
+                raise ValueError('candidate class is not active')
+            new_by_class[label].add(int(item['sample_id']))
+        counts = {**self.seen_counts,
+                  **{label: len(ids) for label, ids in new_by_class.items()}}
+        if set(classes) != set(counts):
+            raise ValueError('active classes must match all seen classes')
+        sample_limit = math.floor(sum(counts.values()) * self.max_fraction)
+        capacity = min(self._capacity(), sample_limit)
+        if capacity < len(classes):
+            raise ValueError('replay budget cannot retain one sample per class; '
+                             'increase bytes/fraction without exceeding 10%')
         pool: Dict[int, Dict[int, dict]] = {c: {} for c in classes}
         for item in self.all() + list(new_candidates):
             label = int(item['y'])
@@ -101,18 +126,38 @@ class ReplayBuffer:
                 persistent = self._persistent(item)
                 pool[label].setdefault(int(persistent['sample_id']), persistent)
 
-        capacity = self._capacity()
-        base, remainder = divmod(capacity, max(1, len(classes)))
+        # Redistribute unfilled quotas without recovering discarded old data.
+        quotas = {label: 0 for label in classes}
+        remaining = capacity
+        while remaining:
+            added = False
+            for label in classes:
+                if quotas[label] < len(pool[label]):
+                    quotas[label] += 1
+                    remaining -= 1
+                    added = True
+                    if not remaining:
+                        break
+            if not added:
+                break
+        self.seen_counts = counts
         self.items = defaultdict(list)
-        for position, label in enumerate(classes):
-            quota = base + int(position < remainder)
+        for label in classes:
             self.items[label] = self._stratified_select(
-                list(pool[label].values()), quota)
+                list(pool[label].values()), quotas[label])
 
         # The dtype and NumPy header are both included in the check.
         while self.bytes_used > self.byte_budget:
             label = max(classes, key=lambda c: len(self.items[c]))
             self.items[label].pop()
+
+    @property
+    def seen_training_count(self) -> int:
+        return sum(self.seen_counts.values())
+
+    @property
+    def sample_limit(self) -> int:
+        return math.floor(self.seen_training_count * self.max_fraction)
 
     @property
     def bytes_used(self) -> int:
@@ -126,6 +171,8 @@ class ReplayBuffer:
         return {str(label): len(self.items[label]) for label in sorted(self.items)}
 
     def save(self, path: str | Path) -> int:
+        if len(self.all()) > self.sample_limit:
+            raise RuntimeError('replay sample fraction exceeded')
         path = Path(path)
         np.save(path, self._array(self.all()), allow_pickle=False)
         size = path.stat().st_size

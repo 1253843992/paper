@@ -774,6 +774,8 @@ def main() -> None:
                         default=config_values.get('prototypes_per_record', 0))
     parser.add_argument('--memory-bytes', type=int,
                         default=config_values.get('memory_budget_bytes', 32 * 1024 * 1024))
+    parser.add_argument('--replay-fraction', type=float,
+                        default=config_values.get('replay_fraction', 0.1))
     parser.add_argument('--experts-per-stage', type=int,
                         default=config_values.get('experts_per_stage_max', 3))
     parser.add_argument('--expert-limit', type=int,
@@ -789,6 +791,8 @@ def main() -> None:
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--deterministic', action='store_true')
     args = parser.parse_args()
+    if not 0.0 < args.replay_fraction <= 0.1:
+        parser.error('--replay-fraction must be in (0, 0.1]')
     if not 0.0 <= args.spectral_dropout < 1.0:
         parser.error('--spectral-dropout must be in [0, 1)')
     if not math.isfinite(args.lambda_evidence) or args.lambda_evidence < 0:
@@ -857,7 +861,7 @@ def main() -> None:
         expert_limit=args.expert_limit).to(device)
     model.lambda_evidence = args.lambda_evidence
     model.spectral_dropout = args.spectral_dropout
-    memory = ReplayBuffer(args.memory_bytes, args.seed)
+    memory = ReplayBuffer(args.memory_bytes, args.seed, args.replay_fraction)
     stage_results = []
 
     for stage, new_classes in enumerate(order):
@@ -869,6 +873,9 @@ def main() -> None:
         new_dataset = EchoCILDataset(args.data, 'train', new_classes)
         new_items = [new_dataset[index] for index in range(len(new_dataset))]
         old_items = memory.all()
+        old_training_count = memory.seen_training_count
+        if len(old_items) > memory.sample_limit:
+            raise RuntimeError('old replay exceeds the sample budget')
         train_dataset = DictDataset(old_items + new_items, physics_stats)
         val_dataset = EchoCILDataset(args.data, 'val', active_classes)
         test_dataset = EchoCILDataset(args.data, 'test', active_classes)
@@ -967,6 +974,7 @@ def main() -> None:
                     'expert_index': expert_index, 'group': group,
                     'epochs': history,
                 })
+                del group_loader, group_sampler, group_dataset, group_items
 
             new_head.requires_grad_(True)
             backbone_parameters = model.enable_incremental_finetuning()
@@ -1016,9 +1024,8 @@ def main() -> None:
                         protection.basis, old_weight, old_classes,
                         protection.selected, raw)
 
-        # Accuracy-oriented consolidation: the replay budget contains the full
-        # observed training set, so jointly refine all layers with uniform
-        # class sampling. Validation-only early stopping prevents test leakage.
+        # Consolidation sees current new-class data and retained old replay
+        # only. Discarded old training windows are never loaded again.
         if stage > 0 and args.consolidation_epochs > 0:
             model.requires_grad_(True)
             consolidation_loader, consolidation_sampler = make_loader(
@@ -1036,10 +1043,15 @@ def main() -> None:
                 early_stopping_patience=args.early_stopping_patience)
             total_steps += consolidation_steps
             stage_log['consolidation'] = consolidation_history
+            del consolidation_loader, consolidation_sampler
 
+        memory.update(new_items, active_classes)
+        retained_dataset = DictDataset(memory.all(), physics_stats)
         prototype_vectors, prototype_labels, prototype_rpms = build_record_prototypes(
-            model, train_dataset, device, args.batch_size, 0,
+            model, retained_dataset, device, args.batch_size, 0,
             per_record=args.prototypes_per_record)
+        if len(prototype_vectors) > len(memory.all()):
+            raise RuntimeError('prototype library exceeds retained replay count')
         model.set_prototypes(
             prototype_vectors, prototype_labels, prototype_rpms, weight=0.0)
         prototype_settings, prototype_trials = tune_prototype_settings(
@@ -1081,7 +1093,6 @@ def main() -> None:
                 previous_model, model, old_test, new_classes, device,
                 args.batch_size, args.num_workers)
 
-        memory.update(new_items, active_classes)
         memory_size = memory.save(args.output / f'memory_stage_{stage}.npy')
         checkpoint_path = args.output / f'stage_{stage}.pt'
         save_checkpoint(checkpoint_path, model, stage, configuration)
@@ -1106,6 +1117,16 @@ def main() -> None:
             'evidence_trials': evidence_trials,
             'experts_total': len(model.experts),
             'memory_count': len(memory.all()),
+            'seen_training_count': memory.seen_training_count,
+            'replay_sample_limit': memory.sample_limit,
+            'replay_fraction_actual': len(memory.all()) / memory.seen_training_count,
+            'old_training_count': old_training_count,
+            'old_replay_used': len(old_items),
+            'new_training_count': len(new_items),
+            'training_pool_count': len(train_dataset),
+            'prototype_source': 'retained_replay_only',
+            'prototype_tensor_bytes': sum(t.numel() * t.element_size() for t in (
+                prototype_vectors, prototype_labels, prototype_rpms)),
             'memory_counts': memory.counts(),
             'memory_bytes': memory_size,
             'model_bytes': model_bytes,
@@ -1136,6 +1157,9 @@ def main() -> None:
             'memory_bytes': memory_size,
             'protection_rank': protection_json.get('rank', 0),
         }, ensure_ascii=False))
+        # Do not keep previous full new-class datasets or their worker pools
+        # alive into the next stage. Only the bounded buffer survives.
+        del train_loader, train_sampler, train_dataset, new_dataset, new_items, old_items
 
     output = {
         'protocol': 'ECHO-CIL-optimized', 'order_name': args.order,
