@@ -99,10 +99,14 @@ python run_cil_comparison.py \
 
 运行器只有在 `results.json` 明确含 3 个完整阶段，且命令与输入/源码哈希完全一致时才跳过任务；不一致或中断目录不会被自动覆盖。汇总文件为：
 
-- `runs/cil_comparison/comparison_summary.csv`：每个 order/seed 的原始结果；
-- `runs/cil_comparison/comparison_summary.json`：先在相同 order 内对随机种子求均值和标准差，不把类别顺序当随机种子混合。
+- `runs/cil_comparison/comparison_summary.csv`：每个 method/order/seed/stage 一行，包含所有已完成阶段；未跑完三阶段的实验也保留已完成阶段，`run_complete` 表示整次实验是否完成。
+- `test_overall`、`test_macro`、`test_old`、`test_new` 为 0–1 准确率；对应 `_pct` 列为 0–100 百分数。所有方法 stage 0 的旧类准确率统一留空，因为当时没有旧类。
+- `average_incremental_accuracy` 为截至当前阶段的 macro 平均值。只看最终阶段时筛选 `stage=2`；画增量曲线时使用 `stage` 和 `test_macro_pct`。
+- `runs/cil_comparison/comparison_summary.json`：按 method/order/stage 对随机种子求均值和样本标准差；单个种子的标准差为 null。`runs` 和 `completed_runs` 分别表示该阶段可用运行数、整次实验完成数。准确率单位为 0–1。
 
-只重新生成汇总：
+上面的训练命令会在每个方法每个阶段保存结果后自动更新 `comparison_summary.csv`，并打印绝对路径；每个方法结束后还会刷新完成状态，无需另行运行汇总命令。11 种方法、1 个顺序、1 个种子、3 个阶段全部完成时共 33 行数据。
+
+以下命令仅用于不训练、重新整理已有结果的可选操作：
 
 ```bash
 python run_cil_comparison.py --output-root runs/cil_comparison --summarize-only

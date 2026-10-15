@@ -29,19 +29,27 @@ def completed(path):
 def summarize(root):
     rows = []
     for path in sorted(root.glob('*/*/seed_*/results.json')):
-        if not completed(path):
-            continue
         data = json.loads(path.read_text(encoding='utf-8'))
         method, order, seed = path.relative_to(root).parts[:3]
-        final = data['stages'][-1]
-        row = {'method': method, 'order': order, 'seed': int(seed.split('_')[-1]),
-               'final_macro': final['test']['macro'], 'final_old': final['test']['old'],
-               'final_new': final['test']['new'],
-               'average_incremental_accuracy': statistics.mean(s['test']['macro'] for s in data['stages']),
-               'memory_count': final.get('memory_count'),
-               'memory_bytes': final.get('memory_bytes'),
-               'results_path': str(path.resolve())}
-        rows.append(row)
+        history = []
+        for result in sorted(data.get('stages', []), key=lambda s: s['stage']):
+            if 'test' not in result or 'macro' not in result['test']:
+                continue
+            stage, metrics = result['stage'], result['test']
+            history.append(metrics['macro'])
+            row = {'method': method, 'order': order, 'seed': int(seed.split('_')[-1]),
+                   'stage': stage, 'run_complete': completed(path)}
+            for name in ('overall', 'macro', 'old', 'new'):
+                # Stage 0 has no old classes. ECHO historically writes 0 here;
+                # use blank/null for every method rather than a false 0% accuracy.
+                value = None if name == 'old' and stage == 0 else metrics.get(name)
+                row['test_'+name] = value
+                row['test_'+name+'_pct'] = value * 100 if value is not None else None
+            row.update(average_incremental_accuracy=statistics.mean(history),
+                       memory_count=result.get('memory_count'),
+                       memory_bytes=result.get('memory_bytes'),
+                       results_path=str(path.resolve()))
+            rows.append(row)
     if not rows:
         return
     with (root/'comparison_summary.csv').open('w', newline='', encoding='utf-8-sig') as stream:
@@ -49,17 +57,42 @@ def summarize(root):
         writer.writeheader()
         writer.writerows(rows)
     aggregate = []
-    for method in sorted({row['method'] for row in rows}):
-        # First aggregate seeds WITHIN each order. Do not pretend orders are seeds.
-        for order in sorted({row['order'] for row in rows if row['method'] == method}):
-            group = [row for row in rows if row['method'] == method and row['order'] == order]
-            entry = {'method': method, 'order': order, 'runs': len(group)}
-            for name in ('final_macro', 'final_old', 'final_new', 'average_incremental_accuracy'):
-                values = [row[name] for row in group]
-                entry[name+'_mean'] = statistics.mean(values)
-                entry[name+'_std'] = statistics.stdev(values) if len(values) > 1 else None
-            aggregate.append(entry)
+    # Keep orders AND stages separate when aggregating random seeds.
+    keys = sorted({(r['method'], r['order'], r['stage']) for r in rows})
+    for method, order, stage in keys:
+        group = [r for r in rows if (r['method'], r['order'], r['stage']) == (method, order, stage)]
+        entry = {'method': method, 'order': order, 'stage': stage, 'runs': len(group),
+                 'completed_runs': sum(r['run_complete'] for r in group)}
+        for name in ('test_overall', 'test_macro', 'test_old', 'test_new', 'average_incremental_accuracy'):
+            values = [row[name] for row in group if row[name] is not None]
+            entry[name+'_mean'] = statistics.mean(values) if values else None
+            entry[name+'_std'] = statistics.stdev(values) if len(values) > 1 else None
+        aggregate.append(entry)
     (root/'comparison_summary.json').write_text(json.dumps(aggregate, indent=2), encoding='utf-8')
+    print(f'SUMMARY updated: {(root / "comparison_summary.csv").resolve()} ({len(rows)} stage rows)', flush=True)
+
+
+def run_training(command, output_root):
+    """Refresh the comparison table whenever a trainer reports a saved stage."""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, encoding='utf-8', errors='replace', bufsize=1) as process:
+        try:
+            for line in process.stdout:
+                print(line, end='', flush=True)
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and 'stage' in event and 'test_macro' in event:
+                    summarize(output_root)
+            code = process.wait()
+            if code:
+                raise subprocess.CalledProcessError(code, command)
+        except BaseException:
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+            raise
 
 
 def main():
@@ -139,7 +172,7 @@ def main():
                     raise RuntimeError(f'Incomplete or different run at {output}; choose a new --output-root. No files overwritten.')
                 # Trainer refuses nonempty output; create receipt only after it exits.
                 try:
-                    subprocess.run(command, check=True)
+                    run_training(command, args.output_root)
                 finally:
                     if output.exists():
                         receipt.write_text(json.dumps({'signature': signature, 'command': command, 'hashes': hashes}, indent=2), encoding='utf-8')

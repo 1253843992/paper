@@ -1,6 +1,7 @@
 import copy
 import tempfile
 import unittest
+from unittest.mock import patch
 from argparse import Namespace
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from torch.nn import functional as F
 from echo_cil.baselines import (METHODS, CILModel, objective, pod_loss,
                                 effective_weights, restore_model)
 from train_cil_baselines import (quotas_for, select_herding, split_bic,
-                                 targets_for, replay_size, update_memory)
+                                 targets_for, replay_size, update_memory, initialize_device)
 from run_cil_comparison import completed
 
 
@@ -23,6 +24,23 @@ def batch(device='cpu'):
 
 
 class BaselineTests(unittest.TestCase):
+    def test_device_initialization_before_statistics(self):
+        events = []
+        with patch('train_cil_baselines.resolve_device', return_value=torch.device('cuda:0')), \
+             patch('torch.cuda.device_count', return_value=1), \
+             patch('torch.cuda.set_device', side_effect=lambda index: events.append(('set', index))), \
+             patch('torch.empty', side_effect=lambda *a, **kw: events.append(('allocate', str(kw['device'])))):
+            self.assertEqual(initialize_device('cuda:0'), torch.device('cuda:0'))
+        self.assertEqual(events, [('set', 0), ('allocate', 'cuda:0')])
+        with patch('train_cil_baselines.resolve_device', return_value=torch.device('cuda:1')), \
+             patch('torch.cuda.device_count', return_value=1), patch('torch.empty') as allocate:
+            with self.assertRaises(ValueError):
+                initialize_device('cuda:1')
+            allocate.assert_not_called()
+        with patch('torch.cuda.set_device') as select:
+            self.assertEqual(initialize_device('cpu'), torch.device('cpu'))
+            select.assert_not_called()
+
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)

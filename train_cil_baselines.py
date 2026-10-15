@@ -33,6 +33,22 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def initialize_device(requested):
+    device = resolve_device(requested)
+    if device.type == 'cuda':
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        count = torch.cuda.device_count()
+        if not 0 <= index < count:
+            raise ValueError(f'CUDA device index {index} is out of range; {count} visible device(s)')
+        device = torch.device('cuda', index)
+        torch.cuda.set_device(index)
+        # Allocator statistics may reject a valid index before lazy CUDA init.
+        # Force a real allocation before the first reset_peak_memory_stats call.
+        probe = torch.empty(1, device=device)
+        del probe
+    return device
+
+
 def loader(items, args, shuffle=False):
     # Evaluation is single-process. Training workers are nonpersistent and fully
     # exhausted each epoch: no accumulating persistent worker/pipe pools.
@@ -404,8 +420,9 @@ def main():
     groups = ORDERS[args.order]
     if list(stats['source_classes']) != groups[0]:
         raise ValueError('Normalization classes do not match order; preprocess this order separately')
-    args.device = resolve_device(args.device)
+    args.device = initialize_device(args.device)
     args.amp = args.amp and args.device.type == 'cuda'
+    print(f'Using {args.device}; AMP={args.amp}', flush=True)
     torch.set_num_threads(args.cpu_threads)
     seed_everything(args.seed)
     if args.deterministic:
