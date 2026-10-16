@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from echo_cil.baselines import METHODS
+from echo_cil.metrics import QUALITY_FIELDS, TIMING_FIELDS, classification_metrics, forgetting_metrics
 from train_echocil import ORDERS
 
 
@@ -32,11 +33,13 @@ def summarize(root):
         data = json.loads(path.read_text(encoding='utf-8'))
         method, order, seed = path.relative_to(root).parts[:3]
         history = []
+        stage_history = []
         for result in sorted(data.get('stages', []), key=lambda s: s['stage']):
             if 'test' not in result or 'macro' not in result['test']:
                 continue
             stage, metrics = result['stage'], result['test']
             history.append(metrics['macro'])
+            stage_history.append(result)
             row = {'method': method, 'order': order, 'seed': int(seed.split('_')[-1]),
                    'stage': stage, 'run_complete': completed(path)}
             for name in ('overall', 'macro', 'old', 'new'):
@@ -45,6 +48,28 @@ def summarize(root):
                 value = None if name == 'old' and stage == 0 else metrics.get(name)
                 row['test_'+name] = value
                 row['test_'+name+'_pct'] = value * 100 if value is not None else None
+            quality = {name: metrics.get(name) for name in QUALITY_FIELDS}
+            confusion = metrics.get('confusion_matrix', metrics.get('confusion'))
+            if confusion is not None:
+                quality.update(classification_metrics(confusion, sum(map(len, ORDERS[order][:stage]))))
+            for name in QUALITY_FIELDS:
+                value = quality[name]
+                row['test_'+name] = value
+                row['test_'+name+'_pct'] = value*100 if value is not None else None
+            for name, value in forgetting_metrics(stage_history).items():
+                row[name] = value
+                row[name+'_pp'] = value*100 if value is not None else None
+            for name in (*TIMING_FIELDS, 'inference_batch_size', 'inference_warmup',
+                         'inference_repeats', 'inference_precision', 'inference_scope',
+                         'inference_cpu_threads', 'inference_device_name'):
+                row[name] = result.get(name)
+            row.update(model_parameters=result.get('model_parameters', result.get('parameters_total')),
+                       peak_expanded_model_parameters=result.get('peak_expanded_model_parameters'),
+                       optimizer_steps=result.get('optimizer_steps', result.get('optimization_steps')),
+                       stage_elapsed_seconds=result.get('elapsed_seconds', result.get('training_seconds')),
+                       peak_cuda_allocated_bytes=result.get('cuda_peak_allocated_bytes', result.get('peak_cuda_bytes')),
+                       replay_fraction_actual=result.get('replay_fraction_actual'),
+                       prototype_tensor_bytes=result.get('prototype_tensor_bytes'))
             row.update(average_incremental_accuracy=statistics.mean(history),
                        memory_count=result.get('memory_count'),
                        memory_bytes=result.get('memory_bytes'),
@@ -63,7 +88,10 @@ def summarize(root):
         group = [r for r in rows if (r['method'], r['order'], r['stage']) == (method, order, stage)]
         entry = {'method': method, 'order': order, 'stage': stage, 'runs': len(group),
                  'completed_runs': sum(r['run_complete'] for r in group)}
-        for name in ('test_overall', 'test_macro', 'test_old', 'test_new', 'average_incremental_accuracy'):
+        for name in ('test_overall', 'test_macro', 'test_old', 'test_new', 'average_incremental_accuracy',
+                     *('test_'+field for field in QUALITY_FIELDS), 'forgetting', 'backward_transfer',
+                     *TIMING_FIELDS, 'model_parameters', 'optimizer_steps', 'stage_elapsed_seconds',
+                     'peak_cuda_allocated_bytes', 'memory_count', 'memory_bytes'):
             values = [row[name] for row in group if row[name] is not None]
             entry[name+'_mean'] = statistics.mean(values) if values else None
             entry[name+'_std'] = statistics.stdev(values) if len(values) > 1 else None

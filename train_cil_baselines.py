@@ -22,6 +22,7 @@ from echo_cil.baselines import (METHODS, CILModel, CosineHead, objective,
                                 effective_weights, kd_loss)
 from echo_cil.data import EchoCILDataset, DictDataset, collate_numpy
 from echo_cil.memory import ReplayBuffer
+from echo_cil.metrics import classification_metrics, benchmark_inference
 from echo_cil.physics import load_physics_stats
 from train_echocil import (ORDERS, resolve_device, seed_everything, amp_context,
                           to_device, experiment_summary)
@@ -505,6 +506,14 @@ def main():
         test = [test_data[i] for i in range(len(test_data))]
         del test_data
         metrics, predicted = evaluate(model, test, groups[:stage+1], args, means)
+        metrics.update(classification_metrics(metrics['confusion_matrix'], old_count))
+        timing_batch = to_device(collate_numpy(test[:32]), args.device)
+        model.eval()
+        def timed_predict():
+            output = model(timing_batch)
+            scores = output['logits'] if means is None else F.normalize(output['features'].float(), dim=1) @ means.T
+            return scores.argmax(1)
+        timing = benchmark_inference(timed_predict, len(test[:32]), args.device)
         stage_result = {'stage': stage, 'test': metrics, 'memory_count': len(memory),
                         'seen_training_count': seen_count, 'new_training_count': len(new),
                         'old_replay_used': len(old), 'training_pool_count': len(train),
@@ -519,6 +528,7 @@ def main():
                         'optimizer_steps': steps, 'training_history': history, 'corrections': corrections,
                         'elapsed_seconds': time.perf_counter()-started,
                         'cuda_peak_allocated_bytes': torch.cuda.max_memory_allocated(args.device) if args.device.type == 'cuda' else None}
+        stage_result.update(timing)
         if args.method in ('icarl', 'podnet'):
             head_metrics, _ = evaluate(model, test, groups[:stage+1], args)
             stage_result['test_head'] = head_metrics

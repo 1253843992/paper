@@ -22,6 +22,7 @@ from echo_cil.data import (
 )
 from echo_cil.guard import build_protection, projection_error
 from echo_cil.memory import ReplayBuffer
+from echo_cil.metrics import classification_metrics, benchmark_inference
 from echo_cil.model import ECHOModel
 from echo_cil.physics import load_physics_stats, physics_features
 
@@ -1082,6 +1083,15 @@ def main() -> None:
         test_result = evaluate(
             model, test_dataset, active_classes, order[:stage + 1], device,
             args.batch_size, args.num_workers)
+        test_result.update(classification_metrics(test_result['confusion'], len(old_classes)))
+        timing_count = min(32, len(test_dataset))
+        timing_batch = to_device(collate_numpy([test_dataset[i] for i in range(timing_count)]), device)
+        model.eval()
+        def timed_predict():
+            scores, _, _ = model(timing_batch['x'], timing_batch['order'],
+                                 timing_batch['quality'], timing_batch['rpm'])
+            return scores.argmax(1)
+        timing = benchmark_inference(timed_predict, timing_count, device)
         export_predictions(args.output / f'predictions_stage_{stage}.csv',
                            model, test_dataset, device, args.batch_size)
         mechanisms = mechanism_metrics(
@@ -1139,6 +1149,7 @@ def main() -> None:
             'training_log': stage_log,
             'device': str(device), 'amp': use_amp,
         }
+        result.update(timing)
         stage_results.append(result)
         # Keep a valid recoverable result after every stage. A later failure
         # must not discard already completed stage metrics.
