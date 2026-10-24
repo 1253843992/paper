@@ -23,6 +23,7 @@ from echo_cil.data import (
 from echo_cil.guard import build_protection, projection_error
 from echo_cil.memory import ReplayBuffer
 from echo_cil.metrics import classification_metrics, benchmark_inference
+from echo_cil.ablations import ABLATIONS, apply_ablation, configure_model
 from echo_cil.model import ECHOModel
 from echo_cil.physics import load_physics_stats, physics_features
 
@@ -135,8 +136,10 @@ def loss_terms(model: ECHOModel, logits: Tensor, batch: Dict[str, Tensor],
                teacher_logits: Optional[Tensor] = None,
                lambda_kd: float = 0.0, kd_temperature: float = 2.0,
                lambda_supcon: float = 0.0, supcon_temperature: float = 0.07,
-               base_stage: bool = False, lambda_metric: float = 0.05):
+               base_stage: bool = False, lambda_metric: Optional[float] = None):
     targets = model.classifier.target_indices(batch['y'])
+    if lambda_metric is None:
+        lambda_metric = model.lambda_metric
     losses = nn.functional.cross_entropy(logits, targets, reduction='none')
     if base_stage:
         sample_weights = torch.ones_like(losses)
@@ -717,6 +720,9 @@ def main() -> None:
             bootstrap_args.config.read_text(encoding='utf-8'))
 
     parser = argparse.ArgumentParser(parents=[bootstrap])
+    parser.add_argument('--ablation', choices=ABLATIONS, default='full')
+    parser.add_argument('--lambda-metric', type=float, default=0.05)
+    parser.add_argument('--cpu-threads', type=int, default=None)
     parser.add_argument('--data', type=Path, default=Path('echo_cil_processed'))
     parser.add_argument('--output', type=Path, default=Path('runs/echo_cil'))
     parser.add_argument('--order', choices=sorted(ORDERS),
@@ -792,6 +798,13 @@ def main() -> None:
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--deterministic', action='store_true')
     args = parser.parse_args()
+    apply_ablation(args)
+    if args.cpu_threads is not None:
+        if args.cpu_threads <= 0:
+            parser.error('--cpu-threads must be positive')
+        torch.set_num_threads(args.cpu_threads)
+    if not math.isfinite(args.lambda_metric) or args.lambda_metric < 0:
+        parser.error('--lambda-metric must be finite and non-negative')
     if not 0.0 < args.replay_fraction <= 0.1:
         parser.error('--replay-fraction must be in (0, 0.1]')
     if not 0.0 <= args.spectral_dropout < 1.0:
@@ -861,6 +874,7 @@ def main() -> None:
         order[0], expert_rank=int(config_values.get('expert_rank', 8)),
         expert_limit=args.expert_limit).to(device)
     model.lambda_evidence = args.lambda_evidence
+    configure_model(model, args)
     model.spectral_dropout = args.spectral_dropout
     memory = ReplayBuffer(args.memory_bytes, args.seed, args.replay_fraction)
     stage_results = []
@@ -928,6 +942,12 @@ def main() -> None:
                 replay_logits, replay_labels, old_classes, old_weight,
                 min_samples=5, lower_quantile=0.10)
             protection_json = protection.to_json()
+            protection_json['constructed_rank'] = protection.rank
+            protection_json['projection_enabled'] = args.projection_enabled
+            if not args.projection_enabled:
+                protection.basis = protection.basis[:, :0]
+                protection.rank = 0
+                protection_json['rank'] = 0
 
             groups, conflict_scores = conflict_groups(
                 model, train_dataset, old_classes, new_classes, device,

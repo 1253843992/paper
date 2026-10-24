@@ -1,5 +1,7 @@
 # ECHO-CIL 类增量对比实验运行与指标说明
 
+基础消融实验使用 `run_cil_ablation.py`，分组、运行命令和核对方式见 [README_CIL_ABLATION.md](README_CIL_ABLATION.md)。
+
 更新日期：2026-10-15。本文对应当前 `run_cil_comparison.py`、`train_cil_baselines.py`、`train_echocil.py` 和 `echo_cil/metrics.py`，覆盖目前 comparison_summary.csv 的全部 54 个字段。
 
 ## 1. 直接运行：训练过程中自动生成汇总

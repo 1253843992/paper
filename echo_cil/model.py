@@ -293,6 +293,8 @@ class ECHOModel(nn.Module):
         nn.init.zeros_(self.spectral_gate[-1].weight)
         nn.init.zeros_(self.spectral_gate[-1].bias)
         self.spectral_dropout = 0.2
+        self.spectrum_mode = 'learned'
+        self.lambda_metric = 0.05
         self.lambda_evidence = 0.3
         self.register_buffer('evidence_weight', torch.tensor(0.0))
         self.register_buffer('prototype_vectors', torch.empty(0, feature_dim))
@@ -321,17 +323,20 @@ class ECHOModel(nn.Module):
         evidence, harmonic_attention = self.evidence(order, rpm)
         time_tokens, scale_weights = self.time(x, evidence, gamma)
         h, cross_attention = self.fusion(time_tokens, evidence, gamma)
-        spectral = self.spectrum(x)
         physical = self.evidence_norm(evidence.mean(dim=1))
-        spectral_gate = torch.sigmoid(self.spectral_gate(
-            torch.cat((h, physical, gamma), dim=1)))
+        spectral_gate = (torch.sigmoid(self.spectral_gate(torch.cat((h, physical, gamma), dim=1)))
+                         if self.spectrum_mode == 'learned' else torch.ones_like(gamma))
         # Drop the entire spectral residual, not individual frequency bins.
         # Do not perturb a frozen backbone during head/expert warm-up.
         contribution = spectral_gate
-        if self.training and any(p.requires_grad for p in self.spectral_gate.parameters()):
+        if self.spectrum_mode != 'off' and self.training and any(p.requires_grad for p in self.spectral_gate.parameters()):
             keep = (torch.rand_like(contribution) >= self.spectral_dropout)
             contribution = contribution * keep / (1.0 - self.spectral_dropout)
-        h = h + contribution * self.spectral_fusion(torch.cat((h, spectral), dim=1))
+        if self.spectrum_mode != 'off':
+            spectral = self.spectrum(x)
+            h = h + contribution * self.spectral_fusion(torch.cat((h, spectral), dim=1))
+        else:
+            spectral_gate = torch.zeros_like(gamma)
         diagnostics = {
             'gamma': gamma, 'harmonic_attention': harmonic_attention,
             'scale_weights': scale_weights, 'cross_attention': cross_attention,
@@ -504,7 +509,9 @@ class ECHOModel(nn.Module):
 
     def architecture_metadata(self) -> Dict[str, object]:
         return {
-            'evidence_supervision': True,
+            'evidence_supervision': self.lambda_evidence > 0,
+            'spectrum_mode': self.spectrum_mode,
+            'lambda_metric': self.lambda_metric,
             'spectral_dropout': self.spectral_dropout,
             'lambda_evidence': self.lambda_evidence,
             'evidence_weight': float(self.evidence_weight),
