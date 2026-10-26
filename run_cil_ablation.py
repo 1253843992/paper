@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 from echo_cil.ablations import ABLATIONS
+from echo_cil.ablation_audit import summarize_audits
 from train_echocil import ORDERS
 from run_cil_comparison import completed, run_training, summarize
 
@@ -27,11 +28,13 @@ def main():
     parser.add_argument('--cpu-threads', type=int, default=4)
     parser.add_argument('--replay-fraction', type=float, default=.1)
     parser.add_argument('--smoke', action='store_true', help='One epoch per training phase; functionality only')
+    parser.add_argument('--audit-inference', action='store_true', help='Export four fixed-checkpoint inference views')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--summarize-only', action='store_true')
     args = parser.parse_args()
     if args.summarize_only:
         summarize(args.output_root)
+        summarize_audits(args.output_root)
         return
     if args.epochs <= 0 or args.batch_size <= 0 or args.batch_size % 2 or args.cpu_threads <= 0 or args.num_workers < 0:
         parser.error('Positive epochs/threads, positive even batch size and nonnegative workers required')
@@ -53,6 +56,8 @@ def main():
                        '--batch-size', str(args.batch_size), '--num-workers', str(args.num_workers),
                        '--cpu-threads', str(args.cpu_threads), '--replay-fraction', str(args.replay_fraction),
                        '--amp' if args.amp else '--no-amp']
+            if args.audit_inference:
+                command += ['--audit-inference']
             if args.smoke:
                 command += ['--head-warmup-epochs', '1', '--expert-warmup-epochs', '1',
                             '--consolidation-epochs', '1', '--prototype-weights', '0',
@@ -67,6 +72,7 @@ def main():
                 if (completed(output/'results.json') and receipt.exists() and
                         json.loads(receipt.read_text())['signature'] == signature):
                     summarize(args.output_root)
+                    summarize_audits(args.output_root)
                     continue
                 raise RuntimeError(f'Incomplete/different run: {output}. Use a new output root.')
             try:
@@ -75,6 +81,7 @@ def main():
                 if output.exists():
                     receipt.write_text(json.dumps(dict(signature=signature, command=command, hashes=hashes), indent=2), encoding='utf-8')
                 summarize(args.output_root)
+                summarize_audits(args.output_root)
 
 
 if __name__ == '__main__':

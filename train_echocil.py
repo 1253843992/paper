@@ -738,6 +738,8 @@ def main() -> None:
                         default=config_values.get('expert_group_warmup_epochs', 3))
     parser.add_argument('--incremental-epochs', type=int,
                         default=config_values.get('incremental_epochs', 60))
+    parser.add_argument('--audit-inference', action='store_true',
+                        help='Evaluate fixed-checkpoint inference views; never select on test results')
     parser.add_argument('--consolidation-epochs', type=int,
                         default=config_values.get('consolidation_epochs', 40))
     parser.add_argument('--lr', type=float, default=config_values.get('lr', 5e-4))
@@ -1104,6 +1106,24 @@ def main() -> None:
             model, test_dataset, active_classes, order[:stage + 1], device,
             args.batch_size, args.num_workers)
         test_result.update(classification_metrics(test_result['confusion'], len(old_classes)))
+        if args.audit_inference:
+            from echo_cil.ablation_audit import inference_views
+            def audit_evaluate():
+                metrics = evaluate(model, test_dataset, active_classes,
+                                   order[:stage + 1], device, args.batch_size, 0)
+                metrics.update(classification_metrics(metrics['confusion'], len(old_classes)))
+                return metrics
+            audit = dict(ablation=args.ablation, order=args.order, seed=args.seed,
+                         stage=stage, spectrum_mode=model.spectrum_mode,
+                         expert_ranks=[int(expert.basis.shape[1]) for expert in model.experts],
+                         protection=protection_json,
+                         lambda_evidence=model.lambda_evidence, lambda_metric=model.lambda_metric,
+                         lambda_supcon=args.lambda_supcon, lambda_kd=args.lambda_kd,
+                         spectral_dropout=model.spectral_dropout,
+                         consolidation_epochs=args.consolidation_epochs,
+                         views=inference_views(model, audit_evaluate))
+            (args.output / f'audit_stage_{stage}.json').write_text(
+                json.dumps(audit, indent=2), encoding='utf-8')
         timing_count = min(32, len(test_dataset))
         timing_batch = to_device(collate_numpy([test_dataset[i] for i in range(timing_count)]), device)
         model.eval()
@@ -1179,9 +1199,18 @@ def main() -> None:
             'stages': stage_results, 'summary': experiment_summary(stage_results),
             'complete': stage == len(order) - 1,
         }
-        (args.output / 'results.json').write_text(
+        (args.output / 'results.json.tmp').write_text(
             json.dumps(partial_output, ensure_ascii=False, indent=2, default=str),
             encoding='utf-8')
+        for attempt in range(20):
+            try:
+                (args.output / 'results.json.tmp').replace(args.output / 'results.json')
+                break
+            except PermissionError:
+                # Windows readers can briefly hold a handle without delete sharing.
+                if attempt == 19:
+                    raise
+                time.sleep(.05)
         print(json.dumps({
             'stage': stage, 'test_macro': test_result['macro'],
             'old': test_result['old'], 'new': test_result['new'],
@@ -1198,9 +1227,8 @@ def main() -> None:
         'stages': stage_results, 'summary': experiment_summary(stage_results),
         'complete': True,
     }
-    (args.output / 'results.json').write_text(
-        json.dumps(output, ensure_ascii=False, indent=2, default=str),
-        encoding='utf-8')
+    # The final stage already saved this complete result. Do not rewrite it
+    # while the parent process is reading the stage notification.
     print(json.dumps(output['summary'], ensure_ascii=False, indent=2))
 
 

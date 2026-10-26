@@ -1,7 +1,8 @@
 """Single-factor basic ablations; apply before validation and config export."""
 ABLATIONS = ('full', 'no_evidence_loss', 'no_spectrum', 'no_spectral_gate',
              'no_spectral_dropout', 'no_projection', 'no_kd',
-             'no_metric_losses', 'no_consolidation')
+             'no_metric_losses', 'no_consolidation', 'no_prototype',
+             'no_evidence_fusion', 'neural_only')
 
 
 def apply_ablation(args):
@@ -11,6 +12,9 @@ def apply_ablation(args):
         'no_kd': {'lambda_kd': 0.0},
         'no_metric_losses': {'lambda_supcon': 0.0, 'lambda_metric': 0.0},
         'no_consolidation': {'consolidation_epochs': 0},
+        'no_prototype': {'prototype_weights': [0.0]},
+        'no_evidence_fusion': {'evidence_weights': [0.0]},
+        'neural_only': {'prototype_weights': [0.0], 'evidence_weights': [0.0]},
     }.get(args.ablation, {})
     for name, value in changes.items():
         setattr(args, name, value)

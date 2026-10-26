@@ -8,6 +8,50 @@ from echo_cil.ablations import apply_ablation, configure_model
 
 
 class AblationTests(unittest.TestCase):
+    def test_projection_executes_and_empty_basis_is_identity(self):
+        from echo_cil.model import ProtectedExpert
+        basis = torch.eye(128)[:, :2]
+        expert = ProtectedExpert(basis, 1, [2])
+        torch.nn.init.normal_(expert.up.weight)
+        h, gamma = torch.randn(3, 128), torch.ones(3, 1)
+        protected, gate, raw = expert(h, gamma)
+        self.assertTrue(torch.allclose(protected[:, :2], torch.zeros(3, 2), atol=1e-6))
+        expert.basis = basis[:, :0]
+        unprotected, gate, raw = expert(h, gamma)
+        self.assertTrue(torch.allclose(unprotected, gate * raw))
+        self.assertFalse(torch.allclose(protected, unprotected))
+
+    def test_inference_views_restore_state_and_rng(self):
+        from echo_cil.ablation_audit import inference_views
+        torch.set_num_threads(2)
+        model = ECHOModel([0, 1]).train()
+        model.prototype_weight.fill_(.75)
+        model.evidence_weight.fill_(.25)
+        rng = torch.get_rng_state().clone()
+        def evaluate():
+            torch.rand(1)
+            return [float(model.prototype_weight), float(model.evidence_weight)]
+        views = inference_views(model, evaluate)
+        self.assertEqual(views['fused']['metrics'], [.75, .25])
+        self.assertEqual(views['neural_only']['metrics'], [0., 0.])
+        self.assertEqual(views['without_prototype']['metrics'], [0., .25])
+        self.assertEqual(views['without_evidence']['metrics'], [.75, 0.])
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+        self.assertTrue(model.training)
+        with self.assertRaises(RuntimeError):
+            inference_views(model, lambda: (_ for _ in ()).throw(RuntimeError()))
+        self.assertEqual(float(model.prototype_weight), .75)
+        self.assertEqual(float(model.evidence_weight), .25)
+
+    def test_fusion_presets(self):
+        for name, p, e in [('no_prototype', [0.], [.5]),
+                           ('no_evidence_fusion', [1.], [0.]),
+                           ('neural_only', [0.], [0.])]:
+            args = argparse.Namespace(ablation=name, prototype_weights=[1.], evidence_weights=[.5])
+            apply_ablation(args)
+            self.assertEqual(args.prototype_weights, p)
+            self.assertEqual(args.evidence_weights, e)
+
     def test_presets_and_no_consolidation_override(self):
         for name, field in [('no_evidence_loss', 'lambda_evidence'),
                             ('no_spectral_dropout', 'spectral_dropout'), ('no_kd', 'lambda_kd')]:
