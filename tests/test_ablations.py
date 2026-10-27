@@ -8,6 +8,47 @@ from echo_cil.ablations import apply_ablation, configure_model
 
 
 class AblationTests(unittest.TestCase):
+    def test_core_paths_and_random_basis(self):
+        from echo_cil.ablations import random_same_rank_basis, class_mean_prototypes
+        torch.set_num_threads(2)
+        model = ECHOModel([0, 1]).eval()
+        batch = (torch.randn(2, 2048), torch.randn(2, 3, 256), torch.randn(2, 9), torch.full((2,), 1790.))
+        args = argparse.Namespace(ablation='no_physical_guidance', lambda_metric=.05)
+        apply_ablation(args)
+        configure_model(model, args)
+        with patch.object(model.evidence, 'forward', side_effect=AssertionError('physical path executed')), \
+             patch.object(model.quality_gate, 'forward', side_effect=AssertionError('quality path executed')):
+            first = model(*batch)[0]
+            second = model(batch[0], batch[1]*3, batch[2]*2, batch[3]+200)[0]
+            self.assertTrue(torch.allclose(first, second))
+        args.ablation = 'mean_fusion'
+        apply_ablation(args)
+        configure_model(model, args)
+        with patch.object(model.fusion.attention, 'forward', side_effect=AssertionError('attention executed')):
+            model(*batch)[0].sum().backward()
+        rng = torch.get_rng_state().clone()
+        basis = random_same_rank_basis(torch.eye(128)[:, :3], 123)
+        self.assertTrue(torch.allclose(basis.T @ basis, torch.eye(3), atol=1e-6))
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+        self.assertTrue(torch.equal(basis, random_same_rank_basis(torch.eye(128)[:, :3], 123)))
+        vectors, labels, rpms = class_mean_prototypes(torch.tensor([[1., 0.], [0., 1.], [1., 0.]]),
+                                                     torch.tensor([0, 0, 1]), torch.tensor([100., 200., 300.]))
+        self.assertEqual(labels.tolist(), [0, 1])
+        self.assertEqual(rpms.tolist(), [150., 300.])
+        self.assertTrue(torch.allclose(vectors.norm(dim=1), torch.ones(2)))
+
+    def test_evaluation_does_not_advance_training_rng(self):
+        import numpy as np
+        from train_echocil import predict_global
+        torch.set_num_threads(2)
+        model = ECHOModel([0, 1]).eval()
+        dataset = [dict(x=np.zeros(2048), order=np.zeros((3, 256)), quality=np.zeros(9),
+                        y=0, rpm=1790., record_id=0, sample_id=0)]
+        rng = torch.get_rng_state().clone()
+        for _ in range(3):
+            predict_global(model, dataset, torch.device('cpu'), 1, 0)
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+
     def test_projection_executes_and_empty_basis_is_identity(self):
         from echo_cil.model import ProtectedExpert
         basis = torch.eye(128)[:, :2]

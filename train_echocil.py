@@ -505,6 +505,7 @@ def teacher_replay_views(teacher: ECHOModel, old_items: Sequence[dict],
 def predict_global(model: ECHOModel, dataset, device: torch.device,
                    batch_size: int, workers: int, return_logits: bool = False):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        generator=torch.Generator().manual_seed(0),
                         collate_fn=collate_numpy,
                         **loader_options(device, workers))
     model.eval(); predictions, labels, outputs = [], [], []
@@ -946,6 +947,10 @@ def main() -> None:
             protection_json = protection.to_json()
             protection_json['constructed_rank'] = protection.rank
             protection_json['projection_enabled'] = args.projection_enabled
+            protection_json['basis_mode'] = args.ablation if args.ablation in ('random_projection', 'no_projection') else 'reliable_relations'
+            if args.ablation == 'random_projection':
+                from echo_cil.ablations import random_same_rank_basis
+                protection.basis = random_same_rank_basis(protection.basis, args.seed + stage * 1000 + 991)
             if not args.projection_enabled:
                 protection.basis = protection.basis[:, :0]
                 protection.rank = 0
@@ -1073,6 +1078,10 @@ def main() -> None:
         prototype_vectors, prototype_labels, prototype_rpms = build_record_prototypes(
             model, retained_dataset, device, args.batch_size, 0,
             per_record=args.prototypes_per_record)
+        if args.ablation == 'class_mean_prototype':
+            from echo_cil.ablations import class_mean_prototypes
+            prototype_vectors, prototype_labels, prototype_rpms = class_mean_prototypes(
+                prototype_vectors, prototype_labels, prototype_rpms)
         if len(prototype_vectors) > len(memory.all()):
             raise RuntimeError('prototype library exceeds retained replay count')
         model.set_prototypes(
@@ -1115,6 +1124,8 @@ def main() -> None:
                 return metrics
             audit = dict(ablation=args.ablation, order=args.order, seed=args.seed,
                          stage=stage, spectrum_mode=model.spectrum_mode,
+                         physical_guidance=model.physical_guidance, fusion_mode=model.fusion.mode,
+                         lambda_competition=args.lambda_competition, lambda_amplitude=args.lambda_amplitude,
                          expert_ranks=[int(expert.basis.shape[1]) for expert in model.experts],
                          protection=protection_json,
                          lambda_evidence=model.lambda_evidence, lambda_metric=model.lambda_metric,

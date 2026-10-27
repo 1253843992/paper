@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from echo_cil.ablations import ABLATIONS
+from echo_cil.ablations import ABLATIONS, BASIC_ABLATIONS, CORE_ABLATIONS
 from echo_cil.ablation_audit import summarize_audits
 from train_echocil import ORDERS
 from run_cil_comparison import completed, run_training, summarize
@@ -17,7 +17,8 @@ def main():
     parser.add_argument('--data', type=Path, default=Path('echo_cil_processed'))
     parser.add_argument('--order', choices=ORDERS, default='O0')
     parser.add_argument('--seeds', type=int, nargs='+', default=[0])
-    parser.add_argument('--ablations', nargs='+', choices=ABLATIONS, default=list(ABLATIONS))
+    parser.add_argument('--suite', choices=['basic', 'core', 'all'], default='basic')
+    parser.add_argument('--ablations', nargs='+', choices=ABLATIONS, default=None)
     parser.add_argument('--output-root', type=Path, default=Path('runs/cil_ablation'))
     parser.add_argument('--config', type=Path, default=Path(__file__).parent/'echo_cil_config.json')
     parser.add_argument('--device', default='auto')
@@ -32,6 +33,8 @@ def main():
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--summarize-only', action='store_true')
     args = parser.parse_args()
+    if args.ablations is None:
+        args.ablations = list({'basic': BASIC_ABLATIONS, 'core': CORE_ABLATIONS, 'all': ABLATIONS}[args.suite])
     if args.summarize_only:
         summarize(args.output_root)
         summarize_audits(args.output_root)

@@ -147,6 +147,7 @@ class TimeEncoder(nn.Module):
 class CrossDomainFusion(nn.Module):
     def __init__(self, dim: int = 128):
         super().__init__()
+        self.mode = 'attention'
         self.time_norm = nn.LayerNorm(dim)
         self.evidence_norm = nn.LayerNorm(dim)
         self.attention = nn.MultiheadAttention(dim, 4, batch_first=True)
@@ -155,6 +156,11 @@ class CrossDomainFusion(nn.Module):
         self.output = nn.Linear(dim, dim)
 
     def forward(self, time_tokens: Tensor, evidence: Tensor, gamma: Tensor):
+        if self.mode == 'mean':
+            interaction = self.evidence_norm(evidence).mean(dim=1, keepdim=True)
+            fused = time_tokens + gamma[:, None, :] * interaction
+            fused = fused + self.ffn(self.ffn_norm(fused))
+            return self.output(fused.mean(dim=1)), None
         interaction, cross_attention = self.attention(
             self.time_norm(time_tokens), self.evidence_norm(evidence),
             self.evidence_norm(evidence), need_weights=True,
@@ -294,6 +300,7 @@ class ECHOModel(nn.Module):
         nn.init.zeros_(self.spectral_gate[-1].bias)
         self.spectral_dropout = 0.2
         self.spectrum_mode = 'learned'
+        self.physical_guidance = True
         self.lambda_metric = 0.05
         self.lambda_evidence = 0.3
         self.register_buffer('evidence_weight', torch.tensor(0.0))
@@ -319,8 +326,13 @@ class ECHOModel(nn.Module):
         return len(self.class_ids)
 
     def base_features(self, x: Tensor, order: Tensor, quality: Tensor, rpm: Tensor):
-        gamma = self.quality_gate(quality)
-        evidence, harmonic_attention = self.evidence(order, rpm)
+        if self.physical_guidance:
+            gamma = self.quality_gate(quality)
+            evidence, harmonic_attention = self.evidence(order, rpm)
+        else:
+            gamma = x.new_ones((x.shape[0], 1))
+            evidence = x.new_zeros((x.shape[0], 21, self.feature_dim))
+            harmonic_attention = None
         time_tokens, scale_weights = self.time(x, evidence, gamma)
         h, cross_attention = self.fusion(time_tokens, evidence, gamma)
         physical = self.evidence_norm(evidence.mean(dim=1))
@@ -511,6 +523,8 @@ class ECHOModel(nn.Module):
         return {
             'evidence_supervision': self.lambda_evidence > 0,
             'spectrum_mode': self.spectrum_mode,
+            'physical_guidance': self.physical_guidance,
+            'fusion_mode': self.fusion.mode,
             'lambda_metric': self.lambda_metric,
             'spectral_dropout': self.spectral_dropout,
             'lambda_evidence': self.lambda_evidence,
