@@ -1,0 +1,48 @@
+{
+  "dataset": "PU",
+  "split_seed": 2026,
+  "split": "whole_record_stratified_12_4_4",
+  "target_fs": 12000,
+  "window": 2048,
+  "windows_per_record": 20,
+  "conditions": [
+    "N09_M07_F10",
+    "N15_M01_F10",
+    "N15_M07_F04",
+    "N15_M07_F10"
+  ],
+  "start_units": "target samples from record time_origin",
+  "base_classes": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "resampling": "timestamp interpolation to mean-rate grid, then antialiased resample_poly",
+  "harmonic_queries": [
+    1.0,
+    2.0,
+    3.0,
+    2.0,
+    4.0,
+    6.0,
+    0.382,
+    0.764,
+    1.146,
+    1.994,
+    3.988,
+    5.982,
+    3.987,
+    7.974,
+    11.961,
+    3.053,
+    6.106,
+    9.158999999999999,
+    4.947,
+    9.894,
+    14.841000000000001
+  ],
+  "training_adapter_required": true,
+  "note": "Trainer still needs PU task orders, model anchors and label semantics adaptation"
+}
