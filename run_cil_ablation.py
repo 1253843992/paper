@@ -20,7 +20,7 @@ def main():
     parser.add_argument('--suite', choices=['basic', 'core', 'all'], default='basic')
     parser.add_argument('--ablations', nargs='+', choices=ABLATIONS, default=None)
     parser.add_argument('--output-root', type=Path, default=Path('runs/cil_ablation'))
-    parser.add_argument('--config', type=Path, default=Path(__file__).parent/'echo_cil_config.json')
+    parser.add_argument('--config', type=Path, default=None)
     parser.add_argument('--device', default='auto')
     parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--epochs', type=int, default=60)
@@ -44,9 +44,13 @@ def main():
     if not 0 < args.replay_fraction <= .1:
         parser.error('--replay-fraction must be in (0,.1]')
     root = Path(__file__).resolve().parent
+    if args.config is None:
+        meta = json.loads((args.data/'preprocess_config.json').read_text(encoding='utf-8'))
+        args.config = root/('echo_cil_pu_config.json' if meta.get('dataset') == 'PU' else 'echo_cil_config.json')
     files = [root/'train_echocil.py', Path(__file__), root/'run_cil_comparison.py',
              *sorted((root/'echo_cil').glob('*.py')), args.config,
-             args.data/'manifest.csv', args.data/'normalization.json']
+             args.data/'manifest.csv', args.data/'normalization.json',
+             args.data/'class_mapping.json', args.data/'preprocess_config.json']
     hashes = {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
     for seed in args.seeds:
         for ablation in args.ablations:

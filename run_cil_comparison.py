@@ -20,7 +20,10 @@ def completed(path):
         return False
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
-        return (len(data.get('stages', [])) == 3 and
+        groups = data.get('configuration', {}).get('task_order', data.get('order'))
+        expected = len(groups) if isinstance(groups, list) else 3
+        return (len(data.get('stages', [])) == expected and
+                sorted(stage['stage'] for stage in data['stages']) == list(range(expected)) and
                 all('test' in stage and 'macro' in stage['test'] for stage in data['stages']) and
                 data.get('status', 'complete') == 'complete' and data.get('complete', True))
     except (ValueError, KeyError, TypeError):
@@ -51,7 +54,10 @@ def summarize(root):
             quality = {name: metrics.get(name) for name in QUALITY_FIELDS}
             confusion = metrics.get('confusion_matrix', metrics.get('confusion'))
             if confusion is not None:
-                quality.update(classification_metrics(confusion, sum(map(len, ORDERS[order][:stage]))))
+                groups = data.get('configuration', {}).get('task_order', data.get('order'))
+                if not isinstance(groups, list):
+                    groups = ORDERS[order]
+                quality.update(classification_metrics(confusion, sum(map(len, groups[:stage]))))
             for name in QUALITY_FIELDS:
                 value = quality[name]
                 row['test_'+name] = value
@@ -177,6 +183,9 @@ def main():
                            '--memory-bytes', str(args.memory_bytes), '--amp' if args.amp else '--no-amp']
                 if method == 'echo':
                     command += ['--base-epochs', str(args.epochs), '--incremental-epochs', str(args.epochs)]
+                    meta = data/'preprocess_config.json'
+                    if meta.exists() and json.loads(meta.read_text(encoding='utf-8')).get('dataset') == 'PU':
+                        command += ['--config', str(root/'echo_cil_pu_config.json')]
                 else:
                     command += ['--method', method, '--epochs', str(args.epochs), '--backbone', args.backbone,
                                 '--selection', args.selection, '--finetune-epochs', str(args.finetune_epochs),
@@ -188,7 +197,9 @@ def main():
                 files = [root/'train_cil_baselines.py', root/'echo_cil'/'baselines.py',
                          root/'train_echocil.py', root/'echo_cil_config.json',
                          *sorted((root/'echo_cil').glob('*.py')),
-                         data/'manifest.csv', data/'normalization.json']
+                         data/'manifest.csv', data/'normalization.json',
+                         data/'class_mapping.json', data/'preprocess_config.json',
+                         root/'echo_cil_pu_config.json']
                 hashes = {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
                 signature = hashlib.sha256(json.dumps([command, hashes], sort_keys=True).encode()).hexdigest()
                 receipt = output/'suite_receipt.json'

@@ -33,6 +33,49 @@ manifest 的 start/end 是目标采样率下相对于记录 time_origin 的位�
 来源：[NTN 6203 技术表](https://docs.rs-online.com/a404/A700000014892791.pdf)。
 不同制造商参数可能不同，后续需评估先验敏感性。回放重建读取 normalization 内相同阶次。
 
-**当前仅完成预处理，不要直接使用旧 CWRU 训练命令。**
-训练端仍需读取 PU 的 15 类六阶段任务顺序、注入模型物理锚点并移除 CWRU 专用类别语义。
-本次不修改 CWRU 原始数据、处理结果或其默认物理先验。
+## PU 训练适配
+
+训练器现在从数据目录读取任务顺序和物理锚点。`--config` 省略时，PU 自动选择
+`echo_cil_pu_config.json`，CWRU 仍选择原配置。建议正式实验显式指定配置以便复现。
+现有 PU 数据只声明 O0；请求 O1～O4 会报错，不会套用 CWRU 顺序。
+初始归一化类别必须与任务初始类别一致；更换初始类别需要重新预处理。
+
+```bash
+# 仅核验协议，不训练、不创建实验目录
+python train_echocil.py --data pu_cil_processed --config echo_cil_pu_config.json --device cpu --validate-only
+
+# 服务器正式运行示例（本地未启动正式实验）
+python train_echocil.py \
+  --data pu_cil_processed \
+  --config echo_cil_pu_config.json \
+  --output runs/pu_echo/O0/seed_0 \
+  --order O0 --seed 0 \
+  --device cuda:0 --amp \
+  --num-workers 4 --cpu-threads 4 --batch-size 128 \
+  --replay-fraction 0.05
+```
+
+CPU 使用 `--device cpu --no-amp --num-workers 0`。已有非空输出目录会被拒绝，避免覆盖结果。
+正式默认基类/增量各 60 epochs，头预热 5、专家预热 3、巩固 40；如需 10 epochs 试运行，
+显式添加 `--base-epochs 10 --incremental-epochs 10`（不改变其他训练阶段的 epoch）。
+
+PU 分类目标仍是 15 个试件/状态，语义只提供 healthy/outer/inner；不推断损伤尺寸或严重程度。
+`prototype_severity_weights` 必须为 `[0.0]`，非零会报错；family 默认也为零，避免未经验证的层级融合。
+特征预处理、回放重建、主模型、ECHO 骨干对照模型使用同一套已保存的近似 6203 锚点。
+checkpoint 保存类别语义和锚点；可通过 `echo_cil.model.restore_echo_model(checkpoint)` 恢复推理模型。
+该函数接收已读取的可信 checkpoint 字典，不负责恢复优化器以继续训练。
+
+六阶段含五次增量：PU 配置每阶段最多 2 个专家、总上限 10（并不保证每阶段一定分配满）。
+CWRU 原配置每阶段最多 3、总上限 6 保持不变；跨数据集资源对比需报告实际专家数和参数量。
+5% 回放上限按累计实际训练窗口数计算，最终最多 floor(14393×0.05)=719 个，仍受字节预算约束。
+
+对比/消融入口已支持读取 PU 协议，结果汇总按实际六阶段判断完成并计算新旧类指标。
+使用这些入口时显式传 `--data pu_cil_processed --orders O0`（消融为 `--order O0`）
+和 `--replay-fraction 0.05`。不使用旧 CWRU 自动原始数据预处理入口。
+
+```bash
+# 开发用缩小数据六阶段检查，不得将其准确率用于论文
+python tests/smoke_pu_training.py --data pu_cil_processed --workspace runs/pu_smoke_check
+```
+
+本次不修改 CWRU 处理结果或默认物理先验，也不修改已有 PU 分片。

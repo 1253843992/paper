@@ -13,6 +13,7 @@ from .physics import (
     FS_TARGET, HARMONIC_NUMBERS, HARMONIC_ORDERS, HARMONIC_TYPES,
     ORDER_MAX, ORDER_POINTS, WINDOW,
 )
+from .protocol import CWRU_SEMANTICS
 
 
 class ConvGNAct(nn.Sequential):
@@ -37,7 +38,7 @@ class QualityGate(nn.Module):
 class HarmonicEvidence(nn.Module):
     """Three-band order encoder plus 21 distance-biased harmonic queries."""
 
-    def __init__(self, dim: int = 128, heads: int = 4):
+    def __init__(self, dim: int = 128, heads: int = 4, harmonic_orders=None):
         super().__init__()
         if dim % heads:
             raise ValueError('feature dimension must be divisible by heads')
@@ -57,7 +58,10 @@ class HarmonicEvidence(nn.Module):
         self.offset_raw = nn.Parameter(torch.zeros(21))
         self.width_raw = nn.Parameter(torch.full(
             (21,), math.log(math.expm1(0.2))))
-        self.register_buffer('anchor_orders', torch.from_numpy(HARMONIC_ORDERS))
+        anchors = np.asarray(HARMONIC_ORDERS if harmonic_orders is None else harmonic_orders, dtype=np.float32)
+        if anchors.shape != (21,) or not np.isfinite(anchors).all() or (anchors <= 0).any():
+            raise ValueError('Expected 21 positive finite harmonic orders')
+        self.register_buffer('anchor_orders', torch.from_numpy(anchors.copy()))
         self.register_buffer('anchor_types', torch.from_numpy(HARMONIC_TYPES))
         self.register_buffer('harmonic_numbers', torch.from_numpy(HARMONIC_NUMBERS))
         token_orders = torch.arange(64, dtype=torch.float32) * 4.0 * ORDER_MAX / (ORDER_POINTS - 1)
@@ -281,9 +285,11 @@ class ECHOModel(nn.Module):
     """Conditional encoder with independently supervised physical evidence."""
 
     def __init__(self, base_classes: Sequence[int], feature_dim: int = 128,
-                 expert_rank: int = 8, expert_limit: int = 4):
+                 expert_rank: int = 8, expert_limit: int = 4,
+                 harmonic_orders=None, class_semantics=None):
         super().__init__()
-        self.evidence = HarmonicEvidence(feature_dim, heads=4)
+        self.evidence = HarmonicEvidence(feature_dim, heads=4, harmonic_orders=harmonic_orders)
+        self.class_semantics = copy.deepcopy(CWRU_SEMANTICS if class_semantics is None else class_semantics)
         self.quality_gate = QualityGate()
         self.time = TimeEncoder()
         self.fusion = CrossDomainFusion(feature_dim)
@@ -407,17 +413,8 @@ class ECHOModel(nn.Module):
                     class_score = class_similarities.topk(
                         neighbors, dim=1).values.mean(dim=1)
                     label_value = int(label)
-                    if label_value == 0:
-                        family_mask = self.prototype_labels == 0
-                        severity_mask = family_mask
-                    else:
-                        prototype_family = 1 + (self.prototype_labels - 1) % 3
-                        prototype_severity = 1 + (self.prototype_labels - 1) // 3
-                        fault_mask = self.prototype_labels > 0
-                        family_mask = fault_mask & (
-                            prototype_family == 1 + (label_value - 1) % 3)
-                        severity_mask = fault_mask & (
-                            prototype_severity == 1 + (label_value - 1) // 3)
+                    family_mask = self.semantic_mask(label_value, 'family')
+                    severity_mask = self.semantic_mask(label_value, 'severity')
                     family_score = similarities[:, family_mask].topk(
                         min(neighbors, int(family_mask.sum())), dim=1).values.mean(dim=1)
                     severity_score = similarities[:, severity_mask].topk(
@@ -440,6 +437,14 @@ class ECHOModel(nn.Module):
                 F.log_softmax(evidence_logits.float(), dim=1) + weight.log())
         return logits, z, diagnostics
 
+    def semantic_mask(self, label: int, field: str) -> Tensor:
+        value = self.class_semantics.get(str(label), {}).get(field)
+        # Unknown severity is not a shared severity group. Fall back to own class.
+        labels = self.prototype_labels.detach().cpu().tolist()
+        return torch.tensor([c == label if value is None else
+            self.class_semantics.get(str(c), {}).get(field) == value for c in labels],
+            dtype=torch.bool, device=self.prototype_labels.device)
+
     def set_prototypes(self, vectors: Tensor, labels: Tensor, rpms: Tensor,
                        weight: float = 0.5) -> None:
         self.prototype_vectors = vectors.detach().float().to(
@@ -456,6 +461,8 @@ class ECHOModel(nn.Module):
     def set_prototype_options(self, neighbors: int, rpm_penalty: float,
                               family_weight: float = 0.0,
                               severity_weight: float = 0.0) -> None:
+        if severity_weight and any(v.get('severity') is None for v in self.class_semantics.values()):
+            raise ValueError('Severity fusion is unavailable for this dataset')
         self.prototype_neighbors.fill_(int(neighbors))
         self.prototype_rpm_penalty.fill_(float(rpm_penalty))
         self.prototype_family_weight.fill_(float(family_weight))
@@ -521,6 +528,8 @@ class ECHOModel(nn.Module):
 
     def architecture_metadata(self) -> Dict[str, object]:
         return {
+            'harmonic_orders': self.evidence.anchor_orders.detach().cpu().tolist(),
+            'class_semantics': copy.deepcopy(self.class_semantics),
             'evidence_supervision': self.lambda_evidence > 0,
             'spectrum_mode': self.spectrum_mode,
             'physical_guidance': self.physical_guidance,
@@ -542,3 +551,27 @@ class ECHOModel(nn.Module):
             'prototype_family_weight': float(self.prototype_family_weight),
             'prototype_severity_weight': float(self.prototype_severity_weight),
         }
+
+
+def restore_echo_model(checkpoint: dict, device='cpu') -> ECHOModel:
+    """Restore a trusted checkpoint including dataset semantics and all stages."""
+    meta, state = checkpoint['architecture'], checkpoint['model']
+    chunks = meta['class_chunks']
+    model = ECHOModel(chunks[0], feature_dim=meta['feature_dim'],
+                      expert_rank=meta['expert_rank'], expert_limit=meta['expert_limit'],
+                      harmonic_orders=meta.get('harmonic_orders'),
+                      class_semantics=meta.get('class_semantics'))
+    for stage, group in enumerate(chunks[1:], 1):
+        model.begin_increment(group, stage)
+    for i, (stage, group) in enumerate(zip(meta['expert_stages'], meta['expert_groups'])):
+        model.current_stage = stage
+        model.add_expert(state[f'experts.{i}.basis'], group)
+    model.current_stage = checkpoint['stage']
+    for name in ('prototype_vectors', 'prototype_labels', 'prototype_rpms'):
+        setattr(model, name, torch.empty_like(state[name], device='cpu'))
+    model.load_state_dict(state)
+    for name in ('spectrum_mode', 'physical_guidance', 'lambda_metric', 'spectral_dropout', 'lambda_evidence'):
+        if name in meta:
+            setattr(model, name, meta[name])
+    model.fusion.mode = meta.get('fusion_mode', 'attention')
+    return model.to(device).eval()

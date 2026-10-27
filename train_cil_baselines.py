@@ -414,11 +414,13 @@ def parse_args():
 
 
 def main():
+    from echo_cil.protocol import load_protocol
     args = parse_args()
     if args.output.exists() and any(args.output.iterdir()):
         raise FileExistsError(f'Output is not empty: {args.output}; use a new directory')
     stats = load_physics_stats(args.data)
-    groups = ORDERS[args.order]
+    protocol = load_protocol(args.data, args.order, stats)
+    groups = protocol['task_order']
     if list(stats['source_classes']) != groups[0]:
         raise ValueError('Normalization classes do not match order; preprocess this order separately')
     args.device = initialize_device(args.device)
@@ -433,6 +435,7 @@ def main():
                          validation_protocol='all_seen_val_selection' if args.selection == 'val_macro' else 'no_validation_selection',
                          memory_protocol='growing_fraction_of_seen_train',
                          test_used_for_training=False, torch_version=torch.__version__)
+    configuration.update(task_order=groups, dataset_protocol=protocol)
     configuration['source_sha256'] = {str(path.relative_to(Path(__file__).parent)): hashlib.sha256(path.read_bytes()).hexdigest()
                                       for path in [Path(__file__), Path(__file__).parent/'echo_cil'/'baselines.py']}
     args.output.mkdir(parents=True, exist_ok=True)
@@ -446,7 +449,8 @@ def main():
         old_count = sum(map(len, groups[:stage]))
         teacher = model.frozen_copy() if model is not None and args.method not in ('er', 'finetune', 'derpp') else None
         if model is None:
-            model = CILModel(args.method, new_classes, args.backbone, args.proxies).to(args.device)
+            model = CILModel(args.method, new_classes, args.backbone, args.proxies,
+                             harmonic_orders=protocol['harmonic_orders']).to(args.device)
         else:
             model.expand(new_classes)
         data = EchoCILDataset(args.data, 'train', new_classes)
@@ -476,7 +480,8 @@ def main():
         peak_parameters = sum(p.numel() for p in model.parameters())
         if args.method == 'foster' and stage:
             boosted = model.frozen_copy()
-            student = CILModel('foster', model.classes, args.backbone, args.proxies).to(args.device)
+            student = CILModel('foster', model.classes, args.backbone, args.proxies,
+                               harmonic_orders=protocol['harmonic_orders']).to(args.device)
             student.encoders[0].load_state_dict(teacher.encoders[0].state_dict())
             with torch.no_grad():
                 student.head.weight[:old_count].copy_(teacher.head.weight)

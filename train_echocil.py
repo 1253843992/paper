@@ -26,15 +26,10 @@ from echo_cil.metrics import classification_metrics, benchmark_inference
 from echo_cil.ablations import ABLATIONS, apply_ablation, configure_model
 from echo_cil.model import ECHOModel
 from echo_cil.physics import load_physics_stats, physics_features
+from echo_cil.protocol import CWRU_ORDERS, load_protocol
 
 
-ORDERS = {
-    'O0': [[0, 1, 2, 3], [4, 5, 6], [7, 8, 9]],
-    'O1': [[0, 7, 8, 9], [4, 5, 6], [1, 2, 3]],
-    'O2': [[0, 4, 9, 2], [6, 1, 8], [3, 7, 5]],
-    'O3': [[0, 8, 3, 4], [2, 7, 6], [9, 5, 1]],
-    'O4': [[0, 6, 7, 5], [1, 9, 2], [8, 4, 3]],
-}
+ORDERS = CWRU_ORDERS  # Compatibility export; active orders come from dataset metadata.
 
 
 def seed_everything(seed: int) -> None:
@@ -713,20 +708,31 @@ def save_checkpoint(path: Path, model: ECHOModel, stage: int,
 def main() -> None:
     default_config = Path(__file__).resolve().parent / 'echo_cil_config.json'
     bootstrap = argparse.ArgumentParser(add_help=False)
-    bootstrap.add_argument('--config', type=Path, default=default_config)
+    bootstrap.add_argument('--config', type=Path, default=None)
+    bootstrap.add_argument('--data', type=Path, default=Path('echo_cil_processed'))
     bootstrap_args, _ = bootstrap.parse_known_args()
+    if bootstrap_args.config is None:
+        data_root = bootstrap_args.data
+        if not data_root.exists():
+            data_root = Path(__file__).resolve().parent / data_root
+        meta_path = data_root / 'preprocess_config.json'
+        if meta_path.exists() and json.loads(meta_path.read_text(encoding='utf-8')).get('dataset') == 'PU':
+            default_config = Path(__file__).resolve().parent / 'echo_cil_pu_config.json'
+        bootstrap_args.config = default_config
+    if not bootstrap_args.config.exists():
+        raise FileNotFoundError(f'Configuration not found: {bootstrap_args.config}')
     config_values = {}
     if bootstrap_args.config.exists():
         config_values = json.loads(
             bootstrap_args.config.read_text(encoding='utf-8'))
 
     parser = argparse.ArgumentParser(parents=[bootstrap])
+    parser.set_defaults(config=bootstrap_args.config)
     parser.add_argument('--ablation', choices=ABLATIONS, default='full')
     parser.add_argument('--lambda-metric', type=float, default=0.05)
     parser.add_argument('--cpu-threads', type=int, default=None)
-    parser.add_argument('--data', type=Path, default=Path('echo_cil_processed'))
     parser.add_argument('--output', type=Path, default=Path('runs/echo_cil'))
-    parser.add_argument('--order', choices=sorted(ORDERS),
+    parser.add_argument('--order',
                         default=config_values.get('order', 'O0'))
     parser.add_argument('--seed', type=int, default=config_values.get('seed', 0))
     parser.add_argument('--batch-size', type=int,
@@ -800,6 +806,7 @@ def main() -> None:
     parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--deterministic', action='store_true')
+    parser.add_argument('--validate-only', action='store_true', help='Check dataset/model protocol without training')
     args = parser.parse_args()
     apply_ablation(args)
     if args.cpu_threads is not None:
@@ -824,7 +831,10 @@ def main() -> None:
     if not args.data.exists():
         raise FileNotFoundError(f'processed data not found: {args.data}')
     physics_stats = load_physics_stats(args.data)
-    order = ORDERS[args.order]
+    protocol = load_protocol(args.data, args.order, physics_stats)
+    order = protocol['task_order']
+    if not protocol['severity_supported'] and any(args.prototype_severity_weights):
+        parser.error('PU has no validated severity labels; use --prototype-severity-weights 0')
     if list(physics_stats['source_classes']) != order[0]:
         raise ValueError(
             f'normalization source classes {physics_stats["source_classes"]} '
@@ -861,11 +871,20 @@ def main() -> None:
         print(f'Using CUDA: {torch.cuda.get_device_name(device)}; AMP={use_amp}')
     else:
         print('Using CPU; AMP=False')
+    if args.validate_only:
+        print(json.dumps(protocol, ensure_ascii=False, indent=2))
+        return
+    if args.output.exists() and any(args.output.iterdir()):
+        raise FileExistsError(f'Output is not empty: {args.output}; use a new directory')
     args.output.mkdir(parents=True, exist_ok=True)
     configuration = vars(args).copy()
     configuration['data'] = str(args.data)
     configuration['output'] = str(args.output)
     configuration['task_order'] = order
+    configuration['dataset_protocol'] = protocol
+    configuration['data_metadata_sha256'] = {
+        name: hashlib.sha256((args.data / name).read_bytes()).hexdigest()
+        for name in ('manifest.csv', 'normalization.json', 'class_mapping.json', 'preprocess_config.json')}
     if args.config.exists():
         configuration['config_sha256'] = hashlib.sha256(
             args.config.read_bytes()).hexdigest()
@@ -875,7 +894,8 @@ def main() -> None:
 
     model = ECHOModel(
         order[0], expert_rank=int(config_values.get('expert_rank', 8)),
-        expert_limit=args.expert_limit).to(device)
+        expert_limit=args.expert_limit, harmonic_orders=protocol['harmonic_orders'],
+        class_semantics=protocol['class_semantics']).to(device)
     model.lambda_evidence = args.lambda_evidence
     configure_model(model, args)
     model.spectral_dropout = args.spectral_dropout

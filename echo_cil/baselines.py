@@ -15,11 +15,11 @@ METHODS = ('finetune', 'er', 'icarl', 'bic', 'lucir', 'wa', 'podnet',
 
 class Backbone(nn.Module):
     """Shared encoder; no protected experts, auxiliary head or inference mixing."""
-    def __init__(self, kind='echo'):
+    def __init__(self, kind='echo', harmonic_orders=None):
         super().__init__()
         self.kind = kind
         if kind == 'echo':
-            source = ECHOModel([0])
+            source = ECHOModel([0], harmonic_orders=harmonic_orders)
             for name in ('evidence', 'quality_gate', 'time', 'fusion', 'spectrum',
                          'spectral_fusion', 'evidence_norm', 'spectral_gate'):
                 setattr(self, name, getattr(source, name))
@@ -69,11 +69,11 @@ class CosineHead(nn.Module):
 
 
 class CILModel(nn.Module):
-    def __init__(self, method, classes, backbone='echo', proxies=10):
+    def __init__(self, method, classes, backbone='echo', proxies=10, harmonic_orders=None):
         super().__init__()
         self.method, self.backbone_kind = method, backbone
         self.classes, self.proxies = list(classes), proxies
-        self.encoders = nn.ModuleList([Backbone(backbone)])
+        self.encoders = nn.ModuleList([Backbone(backbone, harmonic_orders)])
         self.head = self.make_head(len(classes), 128)
         self.aux = None
         self.register_buffer('bias_scale', torch.ones(len(classes)))
