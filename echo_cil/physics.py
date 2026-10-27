@@ -43,7 +43,7 @@ def _map_to_order(power: np.ndarray, freq: np.ndarray, rpm: float) -> np.ndarray
 
 
 def raw_physics_features(x: np.ndarray, rpm: float,
-                         fs: int = FS_TARGET) -> Tuple[np.ndarray, np.ndarray]:
+                         fs: int = FS_TARGET, harmonic_orders=None) -> Tuple[np.ndarray, np.ndarray]:
     """Return unstandardized log-order spectra and nine quality features.
 
     ``x`` is one already base-statistic-normalized waveform.  Filtering and
@@ -78,7 +78,7 @@ def raw_physics_features(x: np.ndarray, rpm: float,
 
         anchor_mask = np.zeros(ORDER_POINTS, dtype=bool)
         peaks = []
-        for anchor in HARMONIC_ORDERS:
+        for anchor in (HARMONIC_ORDERS if harmonic_orders is None else harmonic_orders):
             mask = np.abs(grid - float(anchor)) <= resolution_floor
             anchor_mask |= mask
             if mask.any():
@@ -110,7 +110,8 @@ def apply_physics_stats(order: np.ndarray, quality: np.ndarray,
 
 def physics_features(x: np.ndarray, rpm: float, stats: Mapping[str, object],
                      fs: int = FS_TARGET) -> Tuple[np.ndarray, np.ndarray]:
-    return apply_physics_stats(*raw_physics_features(x, rpm, fs), stats)
+    return apply_physics_stats(*raw_physics_features(
+        x, rpm, fs, stats.get('harmonic_orders')), stats)
 
 
 def load_physics_stats(processed_dir: str | Path) -> dict:
