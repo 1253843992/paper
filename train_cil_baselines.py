@@ -24,6 +24,7 @@ from echo_cil.data import EchoCILDataset, DictDataset, collate_numpy
 from echo_cil.memory import ReplayBuffer
 from echo_cil.metrics import classification_metrics, benchmark_inference
 from echo_cil.physics import load_physics_stats
+from echo_cil.numerics import NumericalWatch
 from train_echocil import (ORDERS, resolve_device, seed_everything, amp_context,
                           to_device, experiment_summary)
 
@@ -157,7 +158,8 @@ def update_memory(model, old, new, seen_count, trajectory, args, stats):
     candidates = {c: [x for x in old + new if x['y'] == c] for c in model.classes}
     if limit < len(model.classes):
         raise ValueError('Replay budget cannot retain one example/class; increase --replay-fraction')
-    per_item = ReplayBuffer._array([new[0]]).nbytes + (50 if args.method == 'derpp' else 0)
+    dark_width = getattr(args, 'total_classes', max(10, len(model.classes)))
+    per_item = ReplayBuffer._array([new[0]]).nbytes + (5*dark_width if args.method == 'derpp' else 0)
     limit = min(limit, max(0, (args.memory_bytes - 2048) // per_item))
     if limit < len(model.classes):
         raise ValueError('Byte budget too small for one example/class')
@@ -179,13 +181,14 @@ def update_memory(model, old, new, seen_count, trajectory, args, stats):
             record = ReplayBuffer._persistent(item)
             if args.method == 'derpp':
                 if c in old_classes:
-                    record['dark_logits'] = item['dark_logits'].copy()
-                    record['dark_mask'] = item['dark_mask'].copy()
+                    width = len(item['dark_logits'])
+                    record['dark_logits'] = np.pad(item['dark_logits'], (0, dark_width-width))
+                    record['dark_mask'] = np.pad(item['dark_mask'], (0, dark_width-width))
                 else:
                     # Captured on first presentation BEFORE its optimizer update.
                     values = trajectory[int(item['sample_id'])]
-                    record['dark_logits'] = np.zeros(10, dtype=np.float32)
-                    record['dark_mask'] = np.zeros(10, dtype=np.bool_)
+                    record['dark_logits'] = np.zeros(dark_width, dtype=np.float32)
+                    record['dark_mask'] = np.zeros(dark_width, dtype=np.bool_)
                     record['dark_logits'][:len(values)] = values
                     record['dark_mask'][:len(values)] = True
             selected.append(record)
@@ -253,19 +256,24 @@ def train_phase(model, teacher, items, old_memory, val, groups, old_count, epoch
     best, best_score, history, steps = None, -math.inf, [], 0
     # LUCIR's old cosine prototypes stay fixed, including AdamW weight decay.
     frozen_rows = model.head.weight[:old_count].detach().clone() if args.method == 'lucir' and old_count else None
+    watch = NumericalWatch(args,model,teacher,optimizer,scaler,len(groups)-1,phase)
     for epoch in range(epochs):
         model.train()
         total, batches = 0., 0
-        for raw in train_loader:
+        for batch_index, raw in enumerate(train_loader):
+            watch.begin(epoch+1,batch_index,raw)
             batch = to_device(raw, args.device)
+            watch.check('input',batch)
             targets = targets_for(batch['y'], model.classes)
             optimizer.zero_grad(set_to_none=True)
             with amp_context(args.device, args.amp):
                 output = model(batch)
+                watch.check('student',output)
                 previous = None
                 if teacher is not None:
                     with torch.no_grad():
                         previous = teacher(batch)
+                    watch.check('teacher',previous)
                 if args.method == 'lucir':
                     output['cosine'] = output['logits'].float() / model.head.log_scale.exp().clamp(max=100)
                 if phase == 'compression':
@@ -274,12 +282,14 @@ def train_phase(model, teacher, items, old_memory, val, groups, old_count, epoch
                     probabilities /= probabilities.sum(1, keepdim=True)
                     loss = -(probabilities * F.log_softmax(output['logits'].float()/args.temperature, 1)).sum(1).mean()
                 else:
+                    components = {}
                     loss = objective(args.method, output, targets, old_count, previous,
                                      temperature=args.temperature, kd_weight=args.kd_weight,
                                      feature_weight=args.lucir_feature_weight,
                                      ranking_margin=args.ranking_margin, ranking_k=args.ranking_k,
                                      pod_spatial=args.pod_spatial, pod_flat=args.pod_flat,
-                                     class_weights=boost_weights)
+                                     class_weights=boost_weights, components=components)
+                    watch.check('loss_components',components)
                 if args.method == 'derpp' and phase == 'train':
                     if epoch == 0:
                         for sid, values in zip(raw['sample_id'], output['logits'].detach().float().cpu().numpy()):
@@ -295,13 +305,18 @@ def train_phase(model, teacher, items, old_memory, val, groups, old_count, epoch
                         replay = to_device(collate_numpy(labelled), args.device)
                         replay_ce = F.cross_entropy(model(replay)['logits'].float(), targets_for(replay['y'], model.classes))
                         loss += args.der_alpha * mse + args.der_beta * replay_ce
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f'{args.method}/{phase}: nonfinite loss')
+            watch.check('loss',loss)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+            if not enabled or getattr(args,'diagnose_nonfinite',False):
+                watch.check('gradients',{n:p.grad for n,p in model.named_parameters() if p.grad is not None})
+            norm=torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+            if not enabled or getattr(args,'diagnose_nonfinite',False):
+                watch.check('gradient_norm',norm)
             scaler.step(optimizer)
             scaler.update()
+            if getattr(args,'diagnose_nonfinite',False):
+                watch.check('updated_parameters',dict(model.named_parameters()))
             if frozen_rows is not None:
                 with torch.no_grad():
                     model.head.weight[:old_count].copy_(frozen_rows)
@@ -323,24 +338,34 @@ def train_phase(model, teacher, items, old_memory, val, groups, old_count, epoch
     return history, steps
 
 
-def calibrate_bic(model, items, old_count, args):
+def calibrate_bic(model, items, old_count, args, stage=-1):
     model.eval()
     scores, targets = [], []
+    watch=NumericalWatch(args,model,None,None,None,stage,'calibration')
     with torch.no_grad():
-        for raw in loader(items, args):
+        for i, raw in enumerate(loader(items, args)):
+            watch.begin(0,i,raw)
             batch = to_device(raw, args.device)
-            scores.append(model(batch)['logits'].float())
+            watch.check('input',batch)
+            logits=model(batch)['logits'].float()
+            watch.check('calibration_logits',logits)
+            scores.append(logits)
             targets.append(targets_for(batch['y'], model.classes))
     scores, targets = torch.cat(scores).detach(), torch.cat(targets)
     scale = nn.Parameter(torch.ones((), device=args.device))
     shift = nn.Parameter(torch.zeros((), device=args.device))
     optimizer = torch.optim.Adam([scale, shift], lr=.01)
-    for _ in range(args.calibration_steps):
+    watch.optimizer=optimizer
+    for step in range(args.calibration_steps):
+        watch.begin(step+1,0,collate_numpy(items))
         corrected = torch.cat((scores[:, :old_count], scores[:, old_count:] * scale + shift), 1)
         loss = F.cross_entropy(corrected, targets)
+        watch.check('calibration_loss',loss)
         optimizer.zero_grad()
         loss.backward()
+        watch.check('calibration_gradients',dict(scale=scale.grad,shift=shift.grad))
         optimizer.step()
+        watch.check('calibration_parameters',dict(scale=scale,shift=shift))
     with torch.no_grad():
         model.bias_scale[old_count:] = scale
         model.bias_shift[old_count:] = shift
@@ -390,6 +415,10 @@ def parse_args():
     parser.add_argument('--foster-beta1', type=float, default=.96)
     parser.add_argument('--foster-beta2', type=float, default=.97)
     parser.add_argument('--deterministic', action='store_true')
+    parser.add_argument('--diagnose-nonfinite', action='store_true',
+                        help='Capture pre-batch RNG; stop on nonfinite AMP gradients instead of scaler skipping')
+    parser.add_argument('--resume-stage0', type=Path,
+                        help='Trusted BiC stage_0.pt; requires sibling memory_stage_0.npz and results.json')
     args = parser.parse_args()
     for name in ('batch_size', 'epochs', 'finetune_epochs', 'compression_epochs',
                  'calibration_steps', 'cpu_threads', 'memory_bytes', 'proxies', 'ranking_k'):
@@ -421,6 +450,7 @@ def main():
     stats = load_physics_stats(args.data)
     protocol = load_protocol(args.data, args.order, stats)
     groups = protocol['task_order']
+    args.total_classes = len(protocol['class_names'])
     if list(stats['source_classes']) != groups[0]:
         raise ValueError('Normalization classes do not match order; preprocess this order separately')
     args.device = initialize_device(args.device)
@@ -442,7 +472,16 @@ def main():
     write_json(args.output/'configuration.json', configuration)
     results = {'configuration': configuration, 'stages': [], 'status': 'running'}
     model, memory, seen_count = None, [], 0
+    if args.resume_stage0:
+        from echo_cil.baseline_resume import resume_bic_stage0
+        model,memory,seen_count,prefix,provenance=resume_bic_stage0(args,protocol)
+        configuration['resume_provenance']=provenance
+        results['stages']=prefix
+        write_json(args.output/'configuration.json',configuration)
+        write_json(args.output/'results.json',results)
     for stage, new_classes in enumerate(groups):
+        if args.resume_stage0 and stage == 0:
+            continue
         started = time.perf_counter()
         if args.device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(args.device)
@@ -473,7 +512,7 @@ def main():
                                      args, trajectory)
         corrections = {}
         if args.method == 'bic' and stage:
-            corrections = calibrate_bic(model, calibration, old_count, args)
+            corrections = calibrate_bic(model, calibration, old_count, args, stage=stage)
             steps += args.calibration_steps
         if args.method in ('wa', 'der_expand', 'foster') and stage:
             corrections['weight_alignment'] = model.align(old_count)

@@ -79,3 +79,40 @@ python tests/smoke_pu_training.py --data pu_cil_processed --workspace runs/pu_sm
 ```
 
 本次不修改 CWRU 处理结果或默认物理先验，也不修改已有 PU 分片。
+
+## BiC 非有限值定位与 Stage 0 重启
+
+服务器出现 `bic/train: nonfinite loss` 时，不再盲目重跑 Stage 0。
+更新代码后使用以下独立训练命令（不是比较脚本参数）：
+
+```bash
+python train_cil_baselines.py \
+  --method bic --data pu_cil_processed --order O0 --seed 0 \
+  --output runs/pu_bic_diagnostic \
+  --resume-stage0 runs/pu_comparison_bic_fp32/bic/O0/seed_0/stage_0.pt \
+  --device cuda:0 --no-amp \
+  --num-workers 4 --cpu-threads 4 --batch-size 128 \
+  --epochs 60 --replay-fraction 0.05 \
+  --diagnose-nonfinite
+```
+
+checkpoint 同目录必须有 `memory_stage_0.npz` 和 `results.json`。只加载自己可信的 checkpoint。
+只支持 BiC 的 Stage 0 边界重启；自动校验方法、种子、任务协议、回放比例、样本来源和波形。
+Stage 0 指标继承，Stage 1 开始重新训练。旧 checkpoint 没有完整随机状态，因而不是逐位复现原轨迹；
+输出 configuration.json 的 resume_provenance 保存来源、哈希和这一限制。
+新输出目录必须为空。诊断重启结果不应混作从头运行的同配置正式重复实验。
+
+非有限值检查包含输入、学生/教师输出、BiC 分类与蒸馏损失、总损失及 FP32 梯度。
+`--diagnose-nonfinite` 额外记录每批次前 RNG，检查更新后参数，并对 AMP 梯度非有限值立即停止；
+普通 AMP 模式仍保留 GradScaler 的梯度溢出处理行为。
+BiC 校准也检查输出、损失和标量参数/梯度。不会用零替换 NaN，也不跳过异常损失批次。
+失败现场写入 `输出目录/diagnostics/`：
+
+- JSON：首次检测位置、stage、epoch、batch、样本 ID、张量范围和非有限值数量。
+- PT：原始批次、观测张量、学生/教师 state_dict、梯度、优化器、scaler 和 RNG。
+
+诊断 PT 不是可直接续训的完整检查点。若仍失败，提供这两个新文件定位 CUDA 异常。
+目前仅在 CPU 验证通过，不宣称已修复服务器 BiC 数值异常的根因。
+
+DER++ 的 dark logits/mask 现在按协议总类别数分配：PU 为 15，CWRU 为 10；
+字节预算计算同步更新。正式新运行必须同步 `train_cil_baselines.py` 和整个 `echo_cil/` 目录。

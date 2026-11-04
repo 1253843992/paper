@@ -160,9 +160,11 @@ def nca_loss(logits, targets, margin=.6):
 
 def objective(method, output, targets, old_count, teacher=None, *, temperature=2.,
               kd_weight=1., feature_weight=5., ranking_margin=.5, ranking_k=2,
-              pod_spatial=5., pod_flat=1., class_weights=None):
+              pod_spatial=5., pod_flat=1., class_weights=None, components=None):
     logits = output['logits'].float()
     ce = F.cross_entropy(logits, targets)
+    if components is not None:
+        components['classification'] = ce
     if method == 'icarl':
         soft = F.one_hot(targets, logits.shape[1]).float()
         if teacher is not None:
@@ -180,6 +182,8 @@ def objective(method, output, targets, old_count, teacher=None, *, temperature=2
         return ce
     if method in ('bic', 'wa'):
         distill = kd_loss(logits[:, :old_count], teacher['logits'], temperature)
+        if components is not None:
+            components['distillation'] = distill
         fraction = old_count / logits.shape[1]
         return (1 - fraction) * ce + fraction * kd_weight * distill
     if method == 'lucir':
